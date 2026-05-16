@@ -8,6 +8,14 @@ from harness import BaseSolution
 
 class Solution(BaseSolution):
     def fit(self, train_df: pd.DataFrame, y: pd.Series, spec) -> None:
+        # Normalize TyreLife during fitting
+        tyre_life_mean = train_df["TyreLife"].mean()
+        tyre_life_std = train_df["TyreLife"].std()
+        self.tyre_life_normalizer = lambda x: (x - tyre_life_mean) / tyre_life_std
+    
+        # Create interaction term between Stint and RaceProgress
+        self.stint_raceprogress_interaction = True
+    
         # Remember which columns to drop so transform() is stateless wrt rows.
         self.drop_cols = []
         if spec.id_col and spec.id_col in train_df.columns:
@@ -16,15 +24,15 @@ class Solution(BaseSolution):
                              if c not in self.drop_cols]
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Add feature interactions
-        df['Year_TyreLife'] = df['Year'] * df['TyreLife']
-        df['Year_RaceProgress'] = df['Year'] / df['RaceProgress']
-        df['TyreLife_LapTime_Delta'] = df['TyreLife'] * df['LapTime_Delta']
-        df['TyreLife_RaceProgress'] = df['TyreLife'] / df['RaceProgress']
-        df['RaceProgress_LapTime_Delta'] = df['RaceProgress'] * df['LapTime_Delta']
-        
+        # Normalize TyreLife
+        df["TyreLife"] = self.tyre_life_normalizer(df["TyreLife"])
+    
+        # Create interaction term between Stint and RaceProgress
+        if self.stint_raceprogress_interaction:
+            df["Stint_RaceProgress"] = df["Stint"] * df["RaceProgress"]
+    
         # Drop the id column if present
-        return df.drop(columns=self.drop_cols, errors='ignore')
+        return df.drop(columns=self.drop_cols, errors="ignore")
 
     def postprocess(self, raw_pred: np.ndarray, df: pd.DataFrame) -> np.ndarray:
         return raw_pred

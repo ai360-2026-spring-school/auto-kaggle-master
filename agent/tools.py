@@ -8,6 +8,7 @@ that bundles the sandbox + relevant filesystem paths.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 from dataclasses import dataclass, field
@@ -19,19 +20,49 @@ from harness.sandbox import static_check as _solution_static_check
 from .exec_sandbox import Sandbox
 
 
-# LLMs frequently wrap code arguments in markdown code fences even though the
-# tool schema specifies a plain string. Strip a single outer fence so
-# `submit_solution` and `python_exec` actually parse.
-_FENCE_RE = re.compile(r"^\s*```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)\n```\s*$", re.S)
+# LLMs frequently wrap code arguments in markdown code fences and/or replace
+# real newlines with literal `\n` escapes. We strip both — independently,
+# because providers sometimes emit only the opening fence (no closing one).
+_LEADING_FENCE_RE = re.compile(
+    r"^\s*```(?:[a-zA-Z0-9_+-]*)\s*(?:\n|\\n)")
+_TRAILING_FENCE_RE = re.compile(r"(?:\n|\\n)```\s*$")
+
+
+def _decode_literal_escapes(code: str) -> str:
+    """Some providers (notably GigaChat) deliver tool-call `code` arguments
+    with LITERAL escape sequences (`\\n`, `\\t`) rather than real newlines.
+
+    Strategy: if `code` parses as Python as-is, return unchanged. Only if
+    parsing fails AND there are literal escapes worth decoding, attempt a
+    `unicode_escape` round-trip; use it iff the decoded version parses. This
+    avoids damaging valid code that intentionally contains `\\n` inside a
+    docstring.
+    """
+    if "\\n" not in code and "\\t" not in code:
+        return code
+    try:
+        ast.parse(code)
+        return code
+    except SyntaxError:
+        pass
+    try:
+        decoded = code.encode("utf-8").decode("unicode_escape")
+        ast.parse(decoded)
+        return decoded
+    except (SyntaxError, UnicodeDecodeError, UnicodeEncodeError):
+        return code
 
 
 def _strip_code_fences(code: str) -> str:
     if not isinstance(code, str):
         return code
-    m = _FENCE_RE.match(code)
-    if m:
-        return m.group(1)
-    return code
+    # Strip leading/trailing fences independently — GigaChat in particular
+    # sometimes sends only the opening ```python without a closing fence.
+    code = _LEADING_FENCE_RE.sub("", code, count=1)
+    code = _TRAILING_FENCE_RE.sub("", code, count=1)
+    # Then decode any remaining literal escapes in the inner code so
+    # static_check / ast.parse see real Python.
+    return _decode_literal_escapes(code)
 
 # --------------------------------------------------------------------------- #
 #  Dataclasses                                                                #

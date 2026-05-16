@@ -169,3 +169,63 @@ def test_python_exec_strips_markdown_fences(ctx):
                  build_tool_registry(), ctx)
     assert not r.is_error, r.content
     assert "3" in r.content
+
+
+def test_submit_solution_decodes_literal_escapes(ctx):
+    """GigaChat sometimes sends `code` with literal '\\n' rather than newlines."""
+    raw = (
+        "from harness import BaseSolution\n"
+        "import pandas as pd\n"
+        "class Solution(BaseSolution):\n"
+        "    def fit(self, train_df, y, spec): pass\n"
+        "    def transform(self, df): return df.select_dtypes(include='number')\n"
+    )
+    wrapped = "```python\n" + raw + "```"
+    literal_escaped = wrapped.replace("\n", "\\n")
+    assert "\n" not in literal_escaped and "\\n" in literal_escaped
+    r = dispatch("submit_solution",
+                 {"code": literal_escaped, "hypothesis": "h"},
+                 build_tool_registry(), ctx)
+    assert not r.is_error, r.content
+    assert ctx.submitted is not None
+    assert "class Solution" in ctx.submitted.code
+    assert "\\n" not in ctx.submitted.code
+
+
+def test_decode_leaves_valid_python_alone(ctx):
+    """If code is already valid Python (with real newlines AND a literal
+    \\n inside a docstring), don't touch it."""
+    code = 'def f():\n    """has \\n inside docstring"""\n    return 1\nf()'
+    r = dispatch("python_exec", {"code": code},
+                 build_tool_registry(), ctx)
+    assert not r.is_error, r.content
+    assert "1" in r.content
+
+
+def test_python_exec_decodes_mixed_escapes(ctx):
+    """Code with mostly literal \\n that does NOT parse as-is should be
+    decoded and run successfully."""
+    fully_escaped = "import pandas as pd\\nx = train.shape\\nx"
+    r = dispatch("python_exec", {"code": fully_escaped},
+                 build_tool_registry(), ctx)
+    assert not r.is_error, r.content
+    assert "(10," in r.content
+
+
+def test_submit_solution_strips_unclosed_leading_fence(ctx):
+    """GigaChat sometimes emits only the opening ```python with no closing
+    fence; we should still extract the code below it."""
+    raw = (
+        "from harness import BaseSolution\n"
+        "import pandas as pd\n"
+        "class Solution(BaseSolution):\n"
+        "    def fit(self, train_df, y, spec): pass\n"
+        "    def transform(self, df): return df.select_dtypes(include='number')\n"
+    )
+    open_only = "```python\n" + raw
+    r = dispatch("submit_solution",
+                 {"code": open_only, "hypothesis": "h"},
+                 build_tool_registry(), ctx)
+    assert not r.is_error, r.content
+    assert ctx.submitted is not None
+    assert ctx.submitted.code.startswith("from harness")

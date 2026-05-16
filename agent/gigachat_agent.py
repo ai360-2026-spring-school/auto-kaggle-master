@@ -10,6 +10,7 @@ ResearchLoop for CV-evaluation.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Optional
 
 from .llm import Proposal
@@ -17,16 +18,55 @@ from .react import AssistantMessage, Backend, ReActDriver, ToolCall, Message
 from .tools import ToolContext, as_gigachat_tools, build_tool_registry
 
 
-class _GigaChatBackend:
-    """Thin adapter wrapping a `bind_tools`-enabled langchain GigaChat client."""
+# GigaChat occasionally drops the first request after a long CV pause
+# (server-side idle TCP/TLS disconnect) and sometimes blows past the default
+# httpx 30s read timeout on Max-tier completions with tools. Both are
+# recoverable; we retry transient httpx errors with exponential backoff.
+_TRANSIENT_ERR_NAMES = {
+    "ReadError", "ReadTimeout", "ConnectError", "ConnectTimeout",
+    "RemoteProtocolError", "ProxyError", "PoolTimeout", "WriteError",
+    "WriteTimeout", "TimeoutError",
+}
 
-    def __init__(self, llm) -> None:
+
+def _is_transient(exc: BaseException) -> bool:
+    if type(exc).__name__ in _TRANSIENT_ERR_NAMES:
+        return True
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        return _is_transient(cause)
+    return False
+
+
+class _GigaChatBackend:
+    """Thin adapter wrapping a `bind_tools`-enabled langchain GigaChat client.
+
+    Retries on transient httpx network errors with exponential backoff. The
+    retry lives in the backend (not in ReActDriver) because only providers
+    know what "transient" means for their wire protocol.
+    """
+
+    def __init__(self, llm, max_retries: int = 4,
+                 base_backoff_sec: float = 2.0) -> None:
         self._llm = llm
+        self._max_retries = max_retries
+        self._base_backoff = base_backoff_sec
 
     def invoke(self, messages: list[Message]) -> AssistantMessage:
         lc_msgs = [_to_langchain(m) for m in messages]
-        ai = self._llm.invoke(lc_msgs)
-        return _from_langchain(ai)
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                ai = self._llm.invoke(lc_msgs)
+                return _from_langchain(ai)
+            except Exception as e:  # noqa: BLE001
+                if not _is_transient(e) or attempt >= self._max_retries:
+                    raise
+                last_exc = e
+                time.sleep(self._base_backoff * (2 ** attempt))
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("backend invoke loop terminated unexpectedly")
 
 
 def _to_langchain(m: Message):
@@ -90,6 +130,8 @@ class GigaChatAgent:
         max_wallclock_sec: float = 900.0,
         temperature: float = 0.2,
         verify_ssl_certs: bool = False,
+        timeout: float = 180.0,
+        max_retries: int = 4,
     ) -> None:
         from langchain_gigachat import GigaChat
         creds = os.environ.get("GIGACHAT_CREDENTIALS")
@@ -98,14 +140,24 @@ class GigaChatAgent:
                 "GIGACHAT_CREDENTIALS env var not set. Export your base64 "
                 "client_id:secret before launching.")
         scope = scope or os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_CORP")
-        self._llm = GigaChat(
+        # `timeout` is forwarded to the underlying httpx client. Default 180s
+        # to absorb slow tool-rich completions on Max-tier.
+        kwargs = dict(
             credentials=creds, scope=scope, model=model,
             verify_ssl_certs=verify_ssl_certs,
             temperature=temperature,
             profanity_check=False,
+            timeout=timeout,
         )
+        try:
+            self._llm = GigaChat(**kwargs)
+        except TypeError:
+            # Older langchain-gigachat versions may not accept `timeout=`.
+            kwargs.pop("timeout", None)
+            self._llm = GigaChat(**kwargs)
         self._max_tool_calls = max_tool_calls
         self._max_wallclock_sec = max_wallclock_sec
+        self._max_retries = max_retries
 
     def propose(self, system_prompt: str, iteration_prompt: str,
                 iteration: int, context: Optional[Any] = None) -> Proposal:
@@ -120,7 +172,7 @@ class GigaChatAgent:
             # Older versions used a different signature; fall back.
             bound = self._llm.bind(tools=wire)
         driver = ReActDriver(
-            backend=_GigaChatBackend(bound),
+            backend=_GigaChatBackend(bound, max_retries=self._max_retries),
             tools=tools, context=context,
             max_tool_calls=self._max_tool_calls,
             max_wallclock_sec=self._max_wallclock_sec,
