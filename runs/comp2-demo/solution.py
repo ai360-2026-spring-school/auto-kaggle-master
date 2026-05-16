@@ -1,3 +1,15 @@
+"""
+solution.py  вЂ”  THE ONLY FILE THE AGENT REWRITES.
+
+This is the analogue of autoresearch's train.py. Everything about how data is
+shaped before the locked CatBoost, and how predictions are shaped after, lives
+here. The harness owns *when* these methods run (fold-safe), the agent owns
+*what* they do.
+
+This baseline is intentionally minimal: drop the id, pass features through,
+identity postprocess. It establishes a valid, leak-free reference score that
+every later experiment must beat. The agent replaces this file wholesale.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -8,14 +20,6 @@ from harness import BaseSolution
 
 class Solution(BaseSolution):
     def fit(self, train_df: pd.DataFrame, y: pd.Series, spec) -> None:
-        # Normalize TyreLife during fitting
-        tyre_life_mean = train_df["TyreLife"].mean()
-        tyre_life_std = train_df["TyreLife"].std()
-        self.tyre_life_normalizer = lambda x: (x - tyre_life_mean) / tyre_life_std
-    
-        # Create interaction term between Stint and RaceProgress
-        self.stint_raceprogress_interaction = True
-    
         # Remember which columns to drop so transform() is stateless wrt rows.
         self.drop_cols = []
         if spec.id_col and spec.id_col in train_df.columns:
@@ -24,15 +28,7 @@ class Solution(BaseSolution):
                              if c not in self.drop_cols]
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Normalize TyreLife
-        df["TyreLife"] = self.tyre_life_normalizer(df["TyreLife"])
-    
-        # Create interaction term between Stint and RaceProgress
-        if self.stint_raceprogress_interaction:
-            df["Stint_RaceProgress"] = df["Stint"] * df["RaceProgress"]
-    
-        # Drop the id column if present
-        return df.drop(columns=self.drop_cols, errors="ignore")
+        return df[self.feature_cols].copy()
 
     def postprocess(self, raw_pred: np.ndarray, df: pd.DataFrame) -> np.ndarray:
         return raw_pred

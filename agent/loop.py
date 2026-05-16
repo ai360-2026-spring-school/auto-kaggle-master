@@ -77,10 +77,15 @@ class ResearchLoop:
             self._log({"event": "AUTO_PROFILE_ERROR", "msg": repr(e)})
 
         # incumbent := baseline solution_template.py
+        # NOTE: write/read explicitly as UTF-8 so non-ASCII chars the LLM may
+        # emit (em-dashes, Cyrillic, etc.) do not break Python's source
+        # compilation on Windows where the default cp1252 encoding triggers
+        # SyntaxError(unicode error) when importlib re-parses the file.
         inc_path = self.work / self.cfg.paths.incumbent_file
         inc_path.write_text(
             Path(__file__).resolve().parents[1].joinpath(
-                "solution_template.py").read_text())
+                "solution_template.py").read_text(encoding="utf-8"),
+            encoding="utf-8")
         incumbent = evaluate_solution(load_solution(inc_path), spec, metric,
                                       self.cfg)
         self._log({"event": "BASELINE", "ok": incumbent.ok,
@@ -139,7 +144,7 @@ class ResearchLoop:
             sandbox.close()
 
             cand_path = self.work / self.cfg.paths.solution_file
-            cand_path.write_text(prop.solution_source)
+            cand_path.write_text(prop.solution_source, encoding="utf-8")
             self._log({"event": "PROPOSE", "iter": it,
                        "msg": prop.reasoning[:300]})
 
@@ -161,7 +166,7 @@ class ResearchLoop:
             })
 
             if accepted:
-                inc_path.write_text(prop.solution_source)
+                inc_path.write_text(prop.solution_source, encoding="utf-8")
                 incumbent = result
                 self._note_top_features(result)
                 self._log({"event": "ACCEPT", "iter": it,

@@ -33,10 +33,10 @@ def _decode_literal_escapes(code: str) -> str:
     with LITERAL escape sequences (`\\n`, `\\t`) rather than real newlines.
 
     Strategy: if `code` parses as Python as-is, return unchanged. Only if
-    parsing fails AND there are literal escapes worth decoding, attempt a
-    `unicode_escape` round-trip; use it iff the decoded version parses. This
-    avoids damaging valid code that intentionally contains `\\n` inside a
-    docstring.
+    parsing fails AND there are literal escapes worth decoding, replace the
+    common ones (\\n, \\t, \\r, \\", \\') with their characters via a
+    targeted substitution (NOT `unicode_escape`, which treats the source as
+    Latin-1 and mangles UTF-8 multibyte characters like em-dashes).
     """
     if "\\n" not in code and "\\t" not in code:
         return code
@@ -45,11 +45,20 @@ def _decode_literal_escapes(code: str) -> str:
         return code
     except SyntaxError:
         pass
+    # Protect literal double-backslash first, then decode the common escapes.
+    sentinel = "\x00\x01\x02"
+    decoded = (code
+               .replace("\\\\", sentinel)
+               .replace("\\n", "\n")
+               .replace("\\t", "\t")
+               .replace("\\r", "\r")
+               .replace("\\\"", "\"")
+               .replace("\\'", "'")
+               .replace(sentinel, "\\\\"))
     try:
-        decoded = code.encode("utf-8").decode("unicode_escape")
         ast.parse(decoded)
         return decoded
-    except (SyntaxError, UnicodeDecodeError, UnicodeEncodeError):
+    except SyntaxError:
         return code
 
 
@@ -126,7 +135,7 @@ def _h_read_incumbent(_args: dict, ctx: ToolContext) -> ToolResult:
     return ToolResult(f"--- incumbent.py ---\n{txt}")
 
 
-_NOISY_EVENTS = {"TOOL_CALL", "TOOL_RESULT"}
+_NOISY_EVENTS = {"TOOL_CALL", "TOOL_RESULT", "TOKEN_USAGE"}
 
 
 def _h_read_journal(args: dict, ctx: ToolContext) -> ToolResult:

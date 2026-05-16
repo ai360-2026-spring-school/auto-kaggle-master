@@ -25,3 +25,7 @@
 
 ---
 ## Agent observations
+
+- [iter 0] The 'id' column is a unique identifier and should be dropped to prevent leakage.
+
+- [iter 2] The 'id' column is a unique identifier and should be dropped to prevent leakage.

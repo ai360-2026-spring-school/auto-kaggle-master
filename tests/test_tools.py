@@ -212,6 +212,27 @@ def test_python_exec_decodes_mixed_escapes(ctx):
     assert "(10," in r.content
 
 
+def test_submit_solution_preserves_em_dash_in_docstring(ctx):
+    """A docstring with an em-dash (or any multibyte UTF-8 char) and code
+    that has literal \\n escapes elsewhere — must NOT corrupt the em-dash
+    when we decode escapes."""
+    raw = (
+        '"""solution.py — THE ONLY FILE THE AGENT REWRITES."""\n'
+        "from harness import BaseSolution\n"
+        "class Solution(BaseSolution):\n"
+        "    def fit(self, train_df, y, spec): pass\n"
+        "    def transform(self, df): return df.select_dtypes(include='number')\n"
+    )
+    # mostly literal-escaped, but with the em-dash preserved as a real character
+    literal_escaped = raw.replace("\n", "\\n")
+    r = dispatch("submit_solution",
+                 {"code": literal_escaped, "hypothesis": "h"},
+                 build_tool_registry(), ctx)
+    assert not r.is_error, r.content
+    assert ctx.submitted is not None
+    assert "—" in ctx.submitted.code   # em-dash preserved
+
+
 def test_submit_solution_strips_unclosed_leading_fence(ctx):
     """GigaChat sometimes emits only the opening ```python with no closing
     fence; we should still extract the code below it."""

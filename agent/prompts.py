@@ -48,33 +48,47 @@ TOOL_USAGE_BLOCK = """
 === EXECUTION ENVIRONMENT (multi-turn tool use) ===
 You have a persistent Python sandbox and several tools. EVERY iteration:
 
-  1. Start with python_exec to look at the data with your own eyes. Useful
-     preloaded names: `train`, `test` (pandas DataFrames; mutate freely),
+  1. **READ THE INCUMBENT FIRST.** The current `solution.py` is the BEST result
+     so far — it has been accepted because it beat every prior candidate by a
+     noise-aware margin. Your job is to BUILD ON TOP OF IT, not replace it.
+     The incumbent's full source is in `incumbent_source` (preloaded in the
+     sandbox) and also returned by `read_incumbent()`. Inspect it, understand
+     every feature it builds, every encoding it learns. Your new solution.py
+     MUST preserve all of that and ADD a focused improvement. Discarding the
+     incumbent's features will almost always lose CV ground that was already
+     won — even a strictly-better hypothesis usually fails CV if you delete
+     the existing engineered features that the harness incumbent score reflects.
+
+  2. Look at the data with python_exec. Useful preloaded names:
+     `train`, `test` (pandas DataFrames, copies — mutate freely),
      `spec` (.target_col/.id_col/.problem_type), `oof` (out-of-fold preds
      of the current incumbent; np.ndarray or None), `feature_importance`
-     (pd.Series or None), `incumbent_source` (str), plus the harness `eda`
-     module (eda.profile / eda.leakage_scan / eda.target_relation /
+     (pd.Series of CatBoost importances on the incumbent or None),
+     `incumbent_source` (str), plus the harness `eda` module
+     (eda.profile / eda.leakage_scan / eda.target_relation /
      eda.interaction_scan; also eda.ydata_profile if installed). Variables
-     persist across calls in this iteration.
+     persist across calls in this iteration. Use `oof` for residual analysis
+     — find segments where the incumbent under-performs, those are where
+     a NEW feature might pay off.
 
-  2. Decide ONE concrete hypothesis from what you observed. Example: "ratio
-     X/Y captures a non-linear signal current model misses", or "OOF errors
-     concentrate in segment Z — calibrate by segment". Avoid kitchen-sink
-     rewrites: blind changes destroy information about cause and effect.
+  3. Decide ONE concrete hypothesis grounded in what you observed AND in
+     what the incumbent is already doing. Avoid duplicating what the
+     incumbent already captures. Avoid blanket rewrites. One legible change
+     per iteration so cause-and-effect on CV stays interpretable.
 
-  3. Persist non-obvious findings via add_insight(text) so future iterations
+  4. Persist non-obvious findings via add_insight(text) so future iterations
      can read them from eda_notebook.md. Use it for facts that survive
-     iterations (e.g. "col Driver has 480 levels and high target MI"), not
+     iterations (e.g. "Driver has 480 levels and high target MI"), not
      fleeting thoughts.
 
-  4. Read read_journal for what already failed before repeating it.
+  5. Read read_journal for what already failed before repeating it. If a
+     prior PROPOSE matches yours, do something different.
 
-  5. End the iteration by calling submit_solution(code, hypothesis,
-     expected_effect) EXACTLY ONCE with a complete solution.py that obeys
-     the contract (fit / transform / postprocess; never reads y in
-     transform; never imports catboost). The harness will CV-evaluate it
-     under leakage-safe folds. Be honest in `expected_effect`: a calibrated
-     prior helps you learn from each experiment.
+  6. End the iteration by calling submit_solution(code, hypothesis,
+     expected_effect) EXACTLY ONCE. The `code` MUST contain everything the
+     incumbent had PLUS your focused new change. Sanity-check: open
+     `incumbent_source` in your head and verify your submitted code retains
+     every engineered feature, encoding, and postprocess step it had.
 
 Tool calls per iteration are capped (typically <= 15). Use them for evidence
 gathering, not micro-tuning of the same idea.
@@ -84,6 +98,22 @@ gathering, not micro-tuning of the same idea.
 def build_tool_system_prompt(program_md: str) -> str:
     """System prompt for tool-using ReAct backends (GigaChat, Yandex, ...)."""
     return build_system_prompt(program_md) + "\n\n" + TOOL_USAGE_BLOCK
+
+
+_STRATEGIC_EVENTS = {"BASELINE", "PROPOSE", "RESULT", "ACCEPT", "EVAL_ERROR",
+                     "AGENT_ERROR", "REACT_TIMEOUT"}
+
+
+def _strategic_journal(journal_tail: list[dict], last_n: int = 25) -> list[dict]:
+    """Filter the journal to STRATEGIC events only and keep the last `last_n`.
+
+    Without this filter, TOOL_CALL/TOOL_RESULT/TOKEN_USAGE noise from a single
+    iteration's ReAct loop (10–15 entries each) pushes PROPOSE/RESULT from
+    prior iterations out of any reasonable sliding window — making the agent
+    effectively amnesiac about what it already tried.
+    """
+    strategic = [r for r in journal_tail if r.get("event") in _STRATEGIC_EVENTS]
+    return strategic[-last_n:]
 
 
 def build_iteration_prompt(
@@ -99,7 +129,8 @@ def build_iteration_prompt(
 ) -> str:
     direction = "HIGHER is better" if greater_is_better else "LOWER is better"
     inc = f"{incumbent_score:.6f}" if incumbent_score is not None else "none yet"
-    journal = json.dumps(journal_tail[-8:], indent=2, default=str)
+    journal = json.dumps(_strategic_journal(journal_tail), indent=2,
+                          default=str)
     return f"""\
 COMPETITION
   {spec_summary}
@@ -115,10 +146,10 @@ DATA DESCRIPTION
 EDA NOTEBOOK (auto-profile + insights from prior iterations)
 {eda_notes or "(empty)"}
 
-EXPERIMENT JOURNAL (recent)
+EXPERIMENT JOURNAL (strategic events only — every prior PROPOSE/RESULT/ACCEPT is here; DO NOT repeat a hypothesis already tried)
 {journal}
 
-CURRENT INCUMBENT solution.py
+CURRENT INCUMBENT solution.py  <-- COPY THIS BLOCK AND ADD TO IT.
 ```python
 {incumbent_source}
 ```
@@ -128,8 +159,13 @@ ALWAYS run at least one python_exec for evidence (check oof residuals, run
 eda.leakage_scan, probe a candidate feature with eda.target_relation, etc.)
 BEFORE writing code, then call submit_solution. If you are not a tool-using
 backend, briefly state your hypothesis and output the COMPLETE new
-solution.py in a python code block. Make one coherent, well-motivated change
-per iteration — do not rewrite everything blindly.
+solution.py in a python code block.
+
+IMPORTANT: Your submitted solution.py MUST start from the incumbent above and
+EXTEND it (preserve every engineered feature/encoding it adds, then layer
+your new change on top). Replacing the incumbent with a fresh from-scratch
+solution will almost certainly lose CV ground it already won. One coherent
+well-motivated change per iteration — never blind rewrites.
 """
 
 

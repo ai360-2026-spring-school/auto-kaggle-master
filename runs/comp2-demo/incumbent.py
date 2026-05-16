@@ -1,3 +1,15 @@
+"""
+solution.py  —  THE ONLY FILE THE AGENT REWRITES.
+
+This is the analogue of autoresearch's train.py. Everything about how data is
+shaped before the locked CatBoost, and how predictions are shaped after, lives
+here. The harness owns *when* these methods run (fold-safe), the agent owns
+*what* they do.
+
+This baseline is intentionally minimal: drop the id, pass features through,
+identity postprocess. It establishes a valid, leak-free reference score that
+every later experiment must beat. The agent replaces this file wholesale.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -16,15 +28,7 @@ class Solution(BaseSolution):
                              if c not in self.drop_cols]
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Add feature interactions
-        df['Year_TyreLife'] = df['Year'] * df['TyreLife']
-        df['Year_RaceProgress'] = df['Year'] / df['RaceProgress']
-        df['TyreLife_LapTime_Delta'] = df['TyreLife'] * df['LapTime_Delta']
-        df['TyreLife_RaceProgress'] = df['TyreLife'] / df['RaceProgress']
-        df['RaceProgress_LapTime_Delta'] = df['RaceProgress'] * df['LapTime_Delta']
-        
-        # Drop the id column if present
-        return df.drop(columns=self.drop_cols, errors='ignore')
+        return df[self.feature_cols].copy()
 
     def postprocess(self, raw_pred: np.ndarray, df: pd.DataFrame) -> np.ndarray:
         return raw_pred

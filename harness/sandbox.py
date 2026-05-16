@@ -50,7 +50,7 @@ def static_check(source: str) -> list[str]:
 def load_solution(path: str | Path) -> BaseSolution:
     """Import solution.py and instantiate its Solution class."""
     path = Path(path)
-    source = path.read_text()
+    source = path.read_text(encoding="utf-8")
     issues = static_check(source)
     if issues:
         raise PermissionError("solution.py rejected: " + "; ".join(issues))

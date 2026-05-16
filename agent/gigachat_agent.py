@@ -44,13 +44,18 @@ class _GigaChatBackend:
     Retries on transient httpx network errors with exponential backoff. The
     retry lives in the backend (not in ReActDriver) because only providers
     know what "transient" means for their wire protocol.
+
+    Optionally emits a TOKEN_USAGE event per call (when langchain surfaces
+    usage_metadata) so the journal can be summed later for cost accounting.
     """
 
     def __init__(self, llm, max_retries: int = 4,
-                 base_backoff_sec: float = 2.0) -> None:
+                 base_backoff_sec: float = 2.0,
+                 on_usage: Optional[Any] = None) -> None:
         self._llm = llm
         self._max_retries = max_retries
         self._base_backoff = base_backoff_sec
+        self._on_usage = on_usage    # callable(dict) or None
 
     def invoke(self, messages: list[Message]) -> AssistantMessage:
         lc_msgs = [_to_langchain(m) for m in messages]
@@ -58,6 +63,7 @@ class _GigaChatBackend:
         for attempt in range(self._max_retries + 1):
             try:
                 ai = self._llm.invoke(lc_msgs)
+                self._record_usage(ai)
                 return _from_langchain(ai)
             except Exception as e:  # noqa: BLE001
                 if not _is_transient(e) or attempt >= self._max_retries:
@@ -67,6 +73,33 @@ class _GigaChatBackend:
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("backend invoke loop terminated unexpectedly")
+
+    def _record_usage(self, ai) -> None:
+        if self._on_usage is None:
+            return
+        usage = getattr(ai, "usage_metadata", None)
+        if not usage:
+            # Fall back to provider-native shape in response_metadata
+            rm = getattr(ai, "response_metadata", {}) or {}
+            token_usage = rm.get("token_usage") or rm.get("usage") or {}
+            if token_usage:
+                usage = {
+                    "input_tokens": token_usage.get("prompt_tokens",
+                                                     token_usage.get("input_tokens", 0)),
+                    "output_tokens": token_usage.get("completion_tokens",
+                                                     token_usage.get("output_tokens", 0)),
+                    "total_tokens": token_usage.get("total_tokens", 0),
+                }
+        if not usage:
+            return
+        try:
+            self._on_usage({
+                "input": int(usage.get("input_tokens", 0)),
+                "output": int(usage.get("output_tokens", 0)),
+                "total": int(usage.get("total_tokens", 0)),
+            })
+        except Exception:
+            pass
 
 
 def _to_langchain(m: Message):
@@ -171,8 +204,14 @@ class GigaChatAgent:
         except TypeError:
             # Older versions used a different signature; fall back.
             bound = self._llm.bind(tools=wire)
+        # Route token-usage events through the loop's journal.
+        on_usage = lambda u: context.on_event(
+            {"event": "TOKEN_USAGE", "iter": context.iteration,
+             "input": u["input"], "output": u["output"],
+             "total": u["total"]})
         driver = ReActDriver(
-            backend=_GigaChatBackend(bound, max_retries=self._max_retries),
+            backend=_GigaChatBackend(bound, max_retries=self._max_retries,
+                                     on_usage=on_usage),
             tools=tools, context=context,
             max_tool_calls=self._max_tool_calls,
             max_wallclock_sec=self._max_wallclock_sec,
