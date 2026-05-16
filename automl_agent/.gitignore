@@ -1,4 +1,0 @@
-runs/
-__pycache__/
-*.pyc
-examples/demo/_groundtruth.csv
