@@ -1,13 +1,10 @@
 """
 Pluggable agent backends.
 
-`AnthropicAgent` / `GigaChatAgent` / `YandexAgent` are the real paths: they
-talk to their respective LLM APIs through the same backend-agnostic
-`ReActDriver`, so the model can call EDA tools to gather evidence before
-emitting a complete new solution.py.
-
-`AnthropicSingleShotAgent` is the original one-shot variant kept for cheap
-A/B comparisons (no tool use).
+`GigaChatAgent` / `YandexAgent` are the real paths: they talk to their
+respective LLM APIs through the same backend-agnostic `ReActDriver`, so the
+model can call EDA tools to gather evidence before emitting a complete new
+solution.py.
 
 `OfflineExpertAgent` is a deterministic stand-in that walks a curriculum of
 strong, standard tabular-ML solutions. It needs no API key, makes the whole
@@ -18,8 +15,6 @@ agnostic. Agents that don't use tools ignore the optional `context` kwarg.
 """
 from __future__ import annotations
 
-import os
-import re
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
@@ -36,40 +31,6 @@ class Proposal:
 class Agent(Protocol):
     def propose(self, system_prompt: str, iteration_prompt: str,
                 iteration: int, context: Optional[Any] = None) -> Proposal: ...
-
-
-# --------------------------------------------------------------------------- #
-#  Real backend                                                               #
-# --------------------------------------------------------------------------- #
-class AnthropicAgent:
-    """One-shot Anthropic backend — no tool use. Kept for back-compat and as
-    a cheap A/B baseline. For tool-using ReAct, use GigaChatAgent or
-    YandexAgent (or build an AnthropicReActAgent via the same react driver)."""
-    def __init__(self, model: str = "claude-opus-4-7", max_tokens: int = 8000):
-        import anthropic  # imported lazily so offline runs need no install
-        self.client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        self.model = model
-        self.max_tokens = max_tokens
-
-    def propose(self, system_prompt: str, iteration_prompt: str,
-                iteration: int, context: Optional[Any] = None) -> Proposal:
-        msg = self.client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": iteration_prompt}],
-        )
-        text = "".join(b.text for b in msg.content if b.type == "text")
-        code = _extract_code(text)
-        if code is None:
-            raise ValueError("Agent response contained no python code block.")
-        reasoning = text.split("```")[0].strip()[:2000]
-        return Proposal(reasoning=reasoning, solution_source=code)
-
-
-def _extract_code(text: str) -> Optional[str]:
-    m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.S)
-    return m.group(1).strip() if m else None
 
 
 # --------------------------------------------------------------------------- #

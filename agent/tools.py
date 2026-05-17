@@ -2,8 +2,7 @@
 Tool registry the ReAct agent calls during one research iteration.
 
 One declarative source (`ToolSpec`) is converted to each backend's wire
-format (`as_openai_tools`, `as_anthropic_tools`, `as_gigachat_tools`,
-`as_yandex_tools`). The handlers run in-process and share a `ToolContext`
+format (`as_openai_tools`, `as_gigachat_tools`, `as_yandex_tools`). The handlers run in-process and share a `ToolContext`
 that bundles the sandbox + relevant filesystem paths.
 """
 from __future__ import annotations
@@ -109,7 +108,7 @@ class ToolResult:
 class ToolSpec:
     name: str
     description: str
-    json_schema: dict                # JSON-Schema, OpenAI/Anthropic-style
+    json_schema: dict                # JSON-Schema (OpenAI-style)
     handler: Callable[[dict, ToolContext], ToolResult]
 
 
@@ -317,20 +316,8 @@ def as_openai_tools(tools: list[ToolSpec]) -> list[dict]:
     ]
 
 
-def as_anthropic_tools(tools: list[ToolSpec]) -> list[dict]:
-    """Anthropic native tool-use shape."""
-    return [
-        {
-            "name": t.name,
-            "description": t.description,
-            "input_schema": t.json_schema,
-        }
-        for t in tools
-    ]
-
-
 # Aliases for clarity at call-sites. The underlying schema is OpenAI-style and
-# all three providers accept it via their langchain integrations or native SDK.
+# both providers accept it via their langchain integrations / native SDK.
 as_gigachat_tools = as_openai_tools
 as_yandex_tools = as_openai_tools
 

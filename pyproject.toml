@@ -12,17 +12,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Anthropic single-shot or future ReAct backend.
-anthropic = ["anthropic>=0.40"]
-
 # GigaChat ReAct backend via langchain-gigachat.
 gigachat = [
     "langchain-gigachat>=0.3",
     "langchain-core>=0.3",
 ]
 
-# Yandex AI Studio (YandexGPT) ReAct backend.
+# Yandex AI Studio (YandexGPT) ReAct backend via gRPC SDK.
 yandex = ["yandex-cloud-ml-sdk>=0.5"]
+
+# Yandex AI Studio OpenAI-compatible HTTP endpoint (qwen3-235b, deepseek,
+# gpt-oss, ...). Uses the official OpenAI SDK.
+yandex-openai = ["openai>=1.50", "httpx>=0.27"]
 
 # Auto-EDA seed (ydata-profiling) — fully optional; the loop falls back to
 # harness.eda if this isn't installed.
@@ -30,7 +31,6 @@ profiling = ["ydata-profiling>=4.13"]
 
 # Convenience meta-extra to pull all optional backends + profiling at once.
 full = [
-    "anthropic>=0.40",
     "langchain-gigachat>=0.3",
     "langchain-core>=0.3",
     "yandex-cloud-ml-sdk>=0.5",

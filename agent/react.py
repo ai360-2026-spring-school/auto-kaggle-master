@@ -10,10 +10,10 @@ when:
   - or the model emits an answer with no tool calls (degenerate path —
     we try to extract a code block from the text as a fallback Proposal).
 
-Decoupled from any specific SDK. Each backend (GigaChat, Yandex AI Studio,
-Anthropic) implements a tiny `Backend` adapter that turns a
-provider-agnostic `Message` list into a provider-native API call and parses
-the response back into a normalized `AssistantMessage`.
+Decoupled from any specific SDK. Each backend (GigaChat, Yandex AI Studio)
+implements a tiny `Backend` adapter that turns a provider-agnostic `Message`
+list into a provider-native API call and parses the response back into a
+normalized `AssistantMessage`.
 """
 from __future__ import annotations
 
@@ -45,6 +45,11 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: Optional[str] = None     # set for role='tool'
     name: Optional[str] = None             # tool name when role='tool'
+    # Provider-native object for assistant turns that contained tool_calls.
+    # Yandex's protocol REQUIRES the original ToolCallList object to be
+    # re-fed when echoing the assistant turn back to the model — a plain
+    # rendered text won't satisfy the "prior tool call" check on tool_results.
+    raw_tool_calls: Optional[Any] = None
 
 
 @dataclass
@@ -53,6 +58,7 @@ class AssistantMessage:
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     raw: Any = None                        # provider-specific object (for debugging)
+    raw_tool_calls: Optional[Any] = None   # provider-native ToolCallList (e.g. Yandex)
 
 
 class Backend(Protocol):
@@ -125,7 +131,8 @@ class ReActDriver:
 
             ai = self._backend.invoke(history)
             history.append(Message(role="assistant", content=ai.content,
-                                   tool_calls=ai.tool_calls))
+                                   tool_calls=ai.tool_calls,
+                                   raw_tool_calls=ai.raw_tool_calls))
 
             # No tool calls: model is talking plain text. Either it's done
             # reasoning (we extract code from the message as a Proposal), or

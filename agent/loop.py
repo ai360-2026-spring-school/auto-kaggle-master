@@ -10,6 +10,7 @@ running and read the journal in the morning.
 from __future__ import annotations
 
 import json
+import sys
 import time
 import traceback
 from dataclasses import asdict
@@ -38,21 +39,27 @@ class ResearchLoop:
         self.notebook_path = self.work / "eda_notebook.md"
         self.fi_notes = ""
         # ReAct backends want the tool-augmented system prompt; the offline
-        # curriculum and the single-shot Anthropic backend ignore it but it
-        # is harmless to include.
+        # curriculum ignores it but it is harmless to include.
         self.use_tool_prompt = use_tool_prompt
         self.max_tool_calls = max_tool_calls
 
     # -- journal ----------------------------------------------------------- #
     def _log(self, record: dict) -> None:
         record["t"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(self.journal_path, "a") as f:
+        with open(self.journal_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, default=str) + "\n")
         tag = record.get("event", "")
         extra = ""
         if "score" in record:
             extra = f" score={record['score']:.6f}" if record["score"] == record["score"] else ""
-        print(f"[{record['t']}] {tag}{extra} {record.get('msg','')}")
+        line = f"[{record['t']}] {tag}{extra} {record.get('msg','')}"
+        # Windows console default codepage (cp1251) can choke on agent-emitted
+        # unicode like non-breaking hyphens (‑). Print bytes safely.
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            enc = sys.stdout.encoding or "ascii"
+            print(line.encode(enc, errors="replace").decode(enc, errors="replace"))
 
     def _read_journal(self) -> list[dict]:
         if not self.journal_path.exists():

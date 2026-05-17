@@ -10,9 +10,8 @@ import pandas as pd
 import pytest
 
 from agent.exec_sandbox import Sandbox
-from agent.tools import (ToolContext, as_anthropic_tools, as_gigachat_tools,
-                         as_openai_tools, as_yandex_tools, build_tool_registry,
-                         dispatch)
+from agent.tools import (ToolContext, as_gigachat_tools, as_openai_tools,
+                         as_yandex_tools, build_tool_registry, dispatch)
 
 
 @pytest.fixture
@@ -53,11 +52,6 @@ def test_openai_schema_shape():
     assert all(s["type"] == "function" for s in schemas)
     assert all("function" in s and "parameters" in s["function"]
                for s in schemas)
-
-
-def test_anthropic_schema_shape():
-    schemas = as_anthropic_tools(build_tool_registry())
-    assert all("input_schema" in s for s in schemas)
 
 
 def test_aliases_match():

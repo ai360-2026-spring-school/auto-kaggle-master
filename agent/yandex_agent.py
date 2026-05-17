@@ -18,50 +18,82 @@ from typing import Any, Optional
 
 from .llm import Proposal
 from .react import AssistantMessage, Backend, Message, ReActDriver, ToolCall
-from .tools import ToolContext, as_yandex_tools, build_tool_registry
+from .tools import ToolContext, build_tool_registry
 
 
 class _YandexBackend:
-    def __init__(self, model_obj, tools_wire: list[dict]) -> None:
+    def __init__(self, model_obj, sdk_tools: list) -> None:
+        # `sdk_tools` is a list of `FunctionTool` proto-wrapped objects
+        # built via `sdk.tools.function(...)`. Plain dicts cause
+        # `'dict' object has no attribute '_to_proto'` inside the SDK.
         self._model = model_obj
-        self._tools_wire = tools_wire
+        self._sdk_tools = sdk_tools
 
     def invoke(self, messages: list[Message]) -> AssistantMessage:
         sdk_messages = [_to_sdk(m) for m in messages]
-        # Newer SDKs accept `tools=` directly; older ones via `.with_tools(...)`.
         try:
-            result = self._model.run(sdk_messages, tools=self._tools_wire)
+            result = self._model.run(sdk_messages, tools=self._sdk_tools)
         except TypeError:
             model = self._model
             if hasattr(model, "with_tools"):
-                model = model.with_tools(self._tools_wire)
+                model = model.with_tools(self._sdk_tools)
             elif hasattr(model, "configure"):
-                model = model.configure(tools=self._tools_wire)
+                model = model.configure(tools=self._sdk_tools)
             result = model.run(sdk_messages)
         return _from_sdk(result)
 
 
-def _to_sdk(m: Message) -> dict:
-    # Yandex uses `text` rather than `content`. For tool messages we still
-    # send the result text under `text` with a `tool_call_id` annotation.
-    if m.role == "system":
-        return {"role": "system", "text": m.content}
-    if m.role == "user":
-        return {"role": "user", "text": m.content}
+class _YandexAssistantToolCallMessage:
+    """Satisfies the SDK's TextMessageWithToolCallsProtocol.
+
+    Yandex requires structured assistant-with-tool-calls echoed back when
+    the next message carries tool_results. We pass the SDK-native
+    `ToolCallList` we got from the model's response — its `_proto_origin`
+    field is what the SDK reads when serializing.
+    """
+
+    def __init__(self, text: str, raw_tool_calls: Any):
+        self.role = "assistant"
+        self.text = text
+        self.tool_calls = raw_tool_calls   # ToolCallList from a prior response
+
+
+def _to_sdk(m: Message):
+    """Translate our normalized Message into Yandex SDK's input type.
+
+    Yandex's protocol is NOT OpenAI-shaped:
+      - No `role="tool"` — tool results travel in a separate message dict
+        `{"tool_results": [{"name", "content", "type": "function"}, ...]}`.
+      - Assistant messages with tool calls require a typed object
+        (TextMessageWithToolCallsProtocol). We pass the original SDK
+        ToolCallList from `raw_tool_calls` — plain text would make Yandex
+        reject the tool_results that follow ("no prior tool call").
+      - Empty `text` is rejected with `INVALID_ARGUMENT: empty message text`,
+        so we always send at least a space.
+    """
+    text = (m.content or "").strip()
     if m.role == "tool":
-        return {"role": "tool", "text": m.content,
-                "tool_call_id": m.tool_call_id or "",
-                "name": m.name or ""}
-    # assistant
-    out: dict = {"role": "assistant", "text": m.content or ""}
-    if m.tool_calls:
-        out["tool_calls"] = [
-            {"id": tc.id, "type": "function",
-             "function": {"name": tc.name,
-                          "arguments": json.dumps(tc.args)}}
-            for tc in m.tool_calls
-        ]
-    return out
+        return {
+            "role": "assistant",
+            "tool_results": [{
+                "name": m.name or "tool",
+                "content": text or " ",
+                "type": "function",
+            }],
+        }
+    if m.role == "assistant" and m.tool_calls:
+        if m.raw_tool_calls is not None:
+            return _YandexAssistantToolCallMessage(
+                text=text or " ", raw_tool_calls=m.raw_tool_calls)
+        rendered = text + ("\n\n" if text else "") + "\n".join(
+            f"[tool_call] {tc.name}({json.dumps(tc.args, ensure_ascii=False)})"
+            for tc in m.tool_calls)
+        return {"role": "assistant", "text": rendered or " "}
+    if m.role == "system":
+        return {"role": "system", "text": text or " "}
+    if m.role == "user":
+        return {"role": "user", "text": text or " "}
+    return {"role": "assistant", "text": text or " "}
 
 
 def _from_sdk(result: Any) -> AssistantMessage:
@@ -105,7 +137,11 @@ def _from_sdk(result: Any) -> AssistantMessage:
         if name:
             calls.append(ToolCall(id=tid, name=name, args=args or {}))
 
-    return AssistantMessage(content=text or "", tool_calls=calls, raw=result)
+    # Preserve SDK-native ToolCallList so we can echo the assistant turn back
+    # in the proper Yandex format (see _YandexAssistantToolCallMessage).
+    raw_tcl = raw_calls if calls else None
+    return AssistantMessage(content=text or "", tool_calls=calls, raw=result,
+                            raw_tool_calls=raw_tcl)
 
 
 class YandexAgent:
@@ -121,6 +157,18 @@ class YandexAgent:
         folder_id: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> None:
+        # The SDK talks gRPC over TLS. On Windows with the system Python,
+        # gRPC ships without a default CA bundle and fails with
+        # CERTIFICATE_VERIFY_FAILED. Point it at certifi's bundle before the
+        # SDK initializes its channel — this is a no-op on systems where
+        # gRPC already finds a CA path.
+        if "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH" not in os.environ:
+            try:
+                import certifi
+                os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = certifi.where()
+            except Exception:
+                pass
+
         try:
             from yandex_cloud_ml_sdk import YCloudML
         except Exception as e:  # noqa: BLE001
@@ -147,9 +195,13 @@ class YandexAgent:
             raise RuntimeError("YandexAgent requires a ToolContext via "
                                "`context=`. Run it through ResearchLoop.")
         tools = build_tool_registry()
-        wire = as_yandex_tools(tools)
+        # Wrap each ToolSpec in the SDK's FunctionTool so model.run accepts
+        # tools=[...]; raw dicts fail with `'dict' has no attribute _to_proto`.
+        sdk_tools = [self._sdk.tools.function(
+            parameters=t.json_schema, name=t.name, description=t.description)
+            for t in tools]
         driver = ReActDriver(
-            backend=_YandexBackend(self._model, wire),
+            backend=_YandexBackend(self._model, sdk_tools),
             tools=tools, context=context,
             max_tool_calls=self._max_tool_calls,
             max_wallclock_sec=self._max_wallclock_sec,

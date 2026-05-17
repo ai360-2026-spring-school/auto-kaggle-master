@@ -7,13 +7,32 @@ Entrypoint.
 Runs the autonomous research loop, then takes the final incumbent solution,
 fits it ONCE on the full training set (fit/transform contract guarantees no
 leak even here), predicts the test set, applies postprocess, and writes
-submission.csv. Uses the offline expert agent unless ANTHROPIC_API_KEY is set
-(or --backend anthropic is passed), so it runs end-to-end out of the box.
+submission.csv. Defaults to the offline expert agent so it runs end-to-end
+out of the box; set --backend gigachat or yandex (with the right env vars)
+to run with a real LLM.
 """
 from __future__ import annotations
 
-import argparse
 import os
+from pathlib import Path as _Path
+
+# MUST be set BEFORE grpc / yandex-cloud-ml-sdk load any transitive gRPC.
+# Yandex Cloud signs its TLS certs with the Russian Trusted Root CA, which
+# is NOT in Mozilla's bundle (= certifi). We ship a combined bundle
+# (certifi + Yandex root CA) at the repo root as `yandex_combined_ca.pem`
+# and point gRPC at it. Env var is read once at C-library init.
+if "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH" not in os.environ:
+    _combined_ca = _Path(__file__).resolve().parent / "yandex_combined_ca.pem"
+    if _combined_ca.exists():
+        os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = str(_combined_ca)
+    else:
+        try:
+            import certifi as _certifi
+            os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = _certifi.where()
+        except Exception:
+            pass
+
+import argparse
 import sys
 from pathlib import Path
 
@@ -23,16 +42,13 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from harness import HarnessConfig, load_solution  # noqa: E402
-from agent import (ResearchLoop, AnthropicAgent, OfflineExpertAgent,  # noqa: E402
-                   make_agent)
+from agent import ResearchLoop, OfflineExpertAgent, make_agent  # noqa: E402
 
 
 def _resolve_backend(name: str) -> str:
     """`auto` picks the best available backend based on env vars."""
     if name != "auto":
         return name
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic"
     if os.environ.get("GIGACHAT_CREDENTIALS"):
         return "gigachat"
     if os.environ.get("YANDEX_API_KEY") and os.environ.get("YANDEX_FOLDER_ID"):
@@ -92,9 +108,13 @@ def main():
     ap.add_argument("--test", required=True)
     ap.add_argument("--out", default="submission.csv")
     ap.add_argument("--backend",
-                    choices=["auto", "anthropic", "gigachat", "yandex",
+                    choices=["auto", "gigachat", "yandex", "yandex-openai",
                              "offline"],
                     default="auto")
+    ap.add_argument("--model", default=None,
+                    help="Model name override (e.g. qwen3-235b-a22b-fp8, "
+                         "deepseek-v3.2, gpt-oss-120b for yandex-openai; "
+                         "yandexgpt-5-pro for yandex; GigaChat-2-Max for gigachat).")
     ap.add_argument("--workdir", default="runs/latest")
     ap.add_argument("--max-iters", type=int, default=None)
     ap.add_argument("--cv-folds", type=int, default=None)
@@ -122,10 +142,17 @@ def main():
 
     backend = _resolve_backend(args.backend)
     agent_kwargs = {}
-    if args.max_tool_calls is not None and backend in ("gigachat", "yandex"):
+    if args.max_tool_calls is not None and backend in ("gigachat", "yandex",
+                                                       "yandex-openai"):
         agent_kwargs["max_tool_calls"] = args.max_tool_calls
+    if args.model is not None and backend in ("gigachat", "yandex",
+                                              "yandex-openai"):
+        agent_kwargs["model"] = args.model
+    if backend == "yandex-openai":
+        # Avast/corporate TLS interception breaks strict OpenSSL on Windows.
+        agent_kwargs.setdefault("verify_ssl", False)
     agent = make_agent(backend, **agent_kwargs)
-    use_tool_prompt = backend in ("gigachat", "yandex")
+    use_tool_prompt = backend in ("gigachat", "yandex", "yandex-openai")
     print(f"agent backend: {type(agent).__name__}")
 
     program_md = str(Path(__file__).resolve().parent / "program.md")

@@ -4,10 +4,11 @@ An agentic pipeline that takes `(task description, data description, train, test
 and autonomously produces `submission.csv`. The ML model is **frozen**; the
 agent's entire job is data — feature engineering before the model and prediction
 shaping after it. Inside each research iteration, a tool-using LLM (GigaChat,
-YandexGPT, or Claude) drives a multi-turn **ReAct loop** with a live Python
-sandbox over the actual data: it runs EDA, inspects out-of-fold residuals,
-forms a hypothesis, and only then commits a new `solution.py` for the harness
-to CV-evaluate.
+YandexGPT, or one of the open-weight models Yandex AI Studio serves via its
+OpenAI-compatible endpoint — Qwen3-235B, DeepSeek-V3.2, GPT-OSS-120B/20B)
+drives a multi-turn **ReAct loop** with a live Python sandbox over the actual
+data: it runs EDA, inspects out-of-fold residuals, forms a hypothesis, and
+only then commits a new `solution.py` for the harness to CV-evaluate.
 
 The design is a direct port of [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
 to tabular ML:
@@ -61,18 +62,20 @@ harness/            LOCKED. Agent imports only BaseSolution.
   sandbox.py         static screening + isolated import of solution.py
 
 agent/
-  llm.py             Agent protocol + Proposal + AnthropicAgent (one-shot)
-                     + OfflineExpertAgent (deterministic curriculum, no API)
-  loop.py            ResearchLoop — baseline → iterate → journal → repeat
-  prompts.py         system / tool-aware / iteration prompt assembly
-  exec_sandbox.py    Sandbox — persistent Python REPL the agent uses for EDA
-  tools.py           ToolSpec registry: python_exec, read_incumbent,
-                     read_journal, add_insight, submit_solution
-  react.py           ReActDriver — backend-agnostic multi-turn tool loop
-  gigachat_agent.py  GigaChat backend (langchain-gigachat + retry/timeout)
-  yandex_agent.py    Yandex AI Studio backend (yandex-cloud-ml-sdk)
-  auto_profile.py    one-shot ydata-profiling seed → eda_notebook.md
-  notebook.py        cross-iteration memory (eda_notebook.md helper)
+  llm.py                  Agent protocol + Proposal + OfflineExpertAgent
+                          (deterministic curriculum, no API key required)
+  loop.py                 ResearchLoop — baseline → iterate → journal → repeat
+  prompts.py              system / tool-aware / iteration prompt assembly
+  exec_sandbox.py         Sandbox — persistent Python REPL the agent uses for EDA
+  tools.py                ToolSpec registry: python_exec, read_incumbent,
+                          read_journal, add_insight, submit_solution
+  react.py                ReActDriver — backend-agnostic multi-turn tool loop
+  gigachat_agent.py       GigaChat backend (langchain-gigachat + retry/timeout)
+  yandex_agent.py         Yandex AI Studio gRPC backend (YandexGPT family)
+  yandex_openai_agent.py  Yandex AI Studio OpenAI-compatible HTTP backend
+                          (Qwen3-235B, DeepSeek-V3.2, GPT-OSS-120B/20B, ...)
+  auto_profile.py         one-shot ydata-profiling seed → eda_notebook.md
+  notebook.py             cross-iteration memory (eda_notebook.md helper)
 
 solution_template.py the baseline the agent starts from and rewrites
 program.md           human-authored strategy (edit this, not the harness)
@@ -143,10 +146,12 @@ pip install -e ".[full]"   # base deps + all optional backends + ydata-profiling
 
 Optional dependency groups (pick what you need):
 
-- `[anthropic]` — Claude backend (`ANTHROPIC_API_KEY`).
 - `[gigachat]` — GigaChat backend (`GIGACHAT_CREDENTIALS`, optional
   `GIGACHAT_SCOPE`).
-- `[yandex]` — YandexGPT backend (`YANDEX_FOLDER_ID`, `YANDEX_API_KEY`).
+- `[yandex]` — YandexGPT gRPC backend (`YANDEX_FOLDER_ID`, `YANDEX_API_KEY`).
+- `[yandex-openai]` — Yandex AI Studio OpenAI-compatible HTTP backend for
+  open-weight models (Qwen3-235B, DeepSeek-V3.2, GPT-OSS-120B/20B). Same
+  env vars as `[yandex]`.
 - `[profiling]` — ydata-profiling auto-EDA seed.
 - `[full]` — all of the above.
 
@@ -156,19 +161,34 @@ Optional dependency groups (pick what you need):
 |---|---|---|---|
 | `auto` | first available below | — | — |
 | `gigachat` | GigaChat-2-Max | yes (ReAct) | `GIGACHAT_CREDENTIALS` |
-| `yandex` | YandexGPT | yes (ReAct) | `YANDEX_FOLDER_ID` + `YANDEX_API_KEY` |
-| `anthropic` | Claude (single-shot) | no | `ANTHROPIC_API_KEY` |
+| `yandex` | YandexGPT family via gRPC SDK (`--model yandexgpt`, `yandexgpt-5-pro`, `yandexgpt-5.1`, `yandexgpt-lite`, ...) | yes (ReAct) | `YANDEX_FOLDER_ID` + `YANDEX_API_KEY` |
+| `yandex-openai` | Open-weight models via Yandex's OpenAI-compatible HTTP endpoint (`--model qwen3-235b-a22b-fp8`, `deepseek-v32`, `gpt-oss-120b`, `gpt-oss-20b`) | yes (ReAct) | `YANDEX_FOLDER_ID` + `YANDEX_API_KEY` |
 | `offline` | none — fixed curriculum | — | nothing |
 
-The GigaChat backend has a built-in retry layer (4 attempts with exponential
-backoff: 2/4/8/16s) over transient `httpx` errors and a 180-second read
-timeout — GigaChat occasionally drops the first request after a long
-CatBoost CV pause (idle TLS reset).
+Backend choice notes:
+
+- **GigaChat** has a built-in retry layer (4 attempts, exponential backoff
+  2/4/8/16s) over transient `httpx` errors and a 180-second read timeout —
+  GigaChat occasionally drops the first request after a long CatBoost CV
+  pause (idle TLS reset).
+- **Yandex gRPC** (`yandex`): the SDK requires a CA bundle that includes the
+  Russian Trusted Root CA (and any corporate SSL inspection is the typical Windows-dev case).
+  `run.py` points `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` at `./yandex_combined_ca.pem` if that
+  file exists, otherwise at certifi's bundle. Build the combined bundle once
+  with `cat $(python -c "import certifi; print(certifi.where())") corporate_root.pem > yandex_combined_ca.pem`.
+- **Yandex OpenAI-compat** (`yandex-openai`): a subset of the AI Studio
+  catalog is exposed only over the OpenAI-compatible HTTP endpoint
+  (`https://llm.api.cloud.yandex.net/v1`), NOT the gRPC SDK. This backend
+  uses the official `openai` Python SDK with custom auth headers (`Authorization: Api-Key …`).
+- **Yandex models that map by short name**: `yandexgpt` and `yandexgpt-5-pro`
+  both resolve to YandexGPT 5 Pro; `yandexgpt-5.1` is YandexGPT 5.1 Pro (the
+  only 5.1-tier variant in the catalog at writing); other 5.1 short names
+  return NOT_FOUND.
 
 ### Sample commands
 
 ```bash
-# F1 Pit Next Lap (binary classification, ROC AUC)
+# F1 Pit Next Lap (binary classification, ROC AUC) — GigaChat
 python run.py \
   --task  competitions/competition-2/overview.txt \
   --data  competitions/competition-2/data.txt \
@@ -178,15 +198,35 @@ python run.py \
   --backend gigachat --max-iters 8 --max-tool-calls 12 \
   --workdir runs/comp2
 
-# Flood prediction (regression, R²)
+# Same task, YandexGPT 5.1 Pro via gRPC
+python run.py \
+  --task  competitions/competition-2/overview.txt \
+  --data  competitions/competition-2/data.txt \
+  --train competitions/competition-2/train.csv \
+  --test  competitions/competition-2/test.csv \
+  --out   competitions/competition-2/submission_yagpt.csv \
+  --backend yandex --model yandexgpt-5.1 \
+  --max-iters 8 --workdir runs/comp2-yagpt
+
+# Same task, Qwen3-235B via OpenAI-compatible HTTP
+python run.py \
+  --task  competitions/competition-2/overview.txt \
+  --data  competitions/competition-2/data.txt \
+  --train competitions/competition-2/train.csv \
+  --test  competitions/competition-2/test.csv \
+  --out   competitions/competition-2/submission_qwen.csv \
+  --backend yandex-openai --model qwen3-235b-a22b-fp8 \
+  --max-iters 8 --workdir runs/comp2-qwen
+
+# Flood prediction (regression, R²) — overnight run
 python run.py \
   --task  competitions/competition-1/overview.txt \
   --data  competitions/competition-1/data.txt \
   --train competitions/competition-1/train.csv \
   --test  competitions/competition-1/test.csv \
   --out   competitions/competition-1/submission.csv \
-  --backend yandex --max-iters 10 \
-  --max-seconds-total 21600 --max-seconds-per-eval 1800
+  --backend yandex-openai --model deepseek-v32 \
+  --max-iters 12 --max-seconds-total 21600 --max-seconds-per-eval 1800
 
 # Offline (no LLM): walks the deterministic curriculum in agent/llm.py
 python run.py \
@@ -224,7 +264,8 @@ full 440k.
 | `--train CSV` | required | |
 | `--test CSV` | required | |
 | `--out FILE` | `submission.csv` | Where the final submission lands. |
-| `--backend` | `auto` | One of `auto/gigachat/yandex/anthropic/offline`. |
+| `--backend` | `auto` | One of `auto/gigachat/yandex/yandex-openai/offline`. |
+| `--model` | (backend default) | Per-backend model name override (e.g. `qwen3-235b-a22b-fp8`, `deepseek-v32`, `gpt-oss-120b`, `yandexgpt-5.1`, `GigaChat-2-Max`). |
 | `--workdir DIR` | `runs/latest` | Per-run journal + incumbent + notebook. |
 | `--max-iters` | `25` (from `harness/config.py`) | Agent edit/evaluate cycles. |
 | `--cv-folds` | `5` | StratifiedKFold/KFold splits. |
@@ -261,11 +302,11 @@ After a run completes, the workdir contains:
 pytest tests/
 ```
 
-36 unit tests cover the sandbox (AST blocks, timeout, persistent namespace,
+39 unit tests cover the sandbox (AST blocks, timeout, persistent namespace,
 DataFrame auto-summary), tool dispatch (schema shape, fence stripping,
-literal-escape decode, `submit_solution` validation), and the ReAct driver
-(success path, code-block fallback, tool-budget exhaustion, hard failure
-without solution).
+literal-escape decode that preserves em-dashes, `submit_solution`
+validation), and the ReAct driver (success path, code-block fallback,
+tool-budget exhaustion, hard failure without solution).
 
 ## Adding a new LLM backend
 
@@ -279,8 +320,10 @@ without solution).
    `--backend` choices.
 4. Add the SDK as an optional dependency group in `pyproject.toml`.
 
-See `agent/gigachat_agent.py` and `agent/yandex_agent.py` for working
-references.
+See `agent/gigachat_agent.py`, `agent/yandex_agent.py`, and
+`agent/yandex_openai_agent.py` for working references covering three quite
+different SDK shapes (langchain wrapping, native gRPC with custom
+ToolCallList objects, and OpenAI-compat HTTP).
 
 ## Limits and natural extensions
 
