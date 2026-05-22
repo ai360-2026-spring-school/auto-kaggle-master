@@ -183,10 +183,10 @@ class Sandbox:
         incumbent_source: str,
         feature_importance: Optional[pd.Series],
         workdir: Path,
-        timeout_sec: int = 60,
-        max_stdout: int = 4000,
-        max_stderr: int = 2000,
-        max_value_chars: int = 4000,
+        timeout_sec: int = 120,
+        max_stdout: int = 4096,
+        max_stderr: int = 2048,
+        max_value_chars: int = 4096,
     ) -> None:
         self.spec = spec
         self.workdir = Path(workdir)

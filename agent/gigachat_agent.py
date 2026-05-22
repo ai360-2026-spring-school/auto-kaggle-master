@@ -159,9 +159,9 @@ class GigaChatAgent:
         self,
         model: str = "GigaChat-2-Max",
         scope: Optional[str] = None,
-        max_tool_calls: int = 15,
+        max_tool_calls: int = 64,
         max_wallclock_sec: float = 900.0,
-        temperature: float = 0.2,
+        temperature: float = 0.6,
         verify_ssl_certs: bool = False,
         timeout: float = 180.0,
         max_retries: int = 4,
@@ -188,6 +188,7 @@ class GigaChatAgent:
             # Older langchain-gigachat versions may not accept `timeout=`.
             kwargs.pop("timeout", None)
             self._llm = GigaChat(**kwargs)
+        self._model = model
         self._max_tool_calls = max_tool_calls
         self._max_wallclock_sec = max_wallclock_sec
         self._max_retries = max_retries
@@ -204,11 +205,18 @@ class GigaChatAgent:
         except TypeError:
             # Older versions used a different signature; fall back.
             bound = self._llm.bind(tools=wire)
-        # Route token-usage events through the loop's journal.
-        on_usage = lambda u: context.on_event(
-            {"event": "TOKEN_USAGE", "iter": context.iteration,
-             "input": u["input"], "output": u["output"],
-             "total": u["total"]})
+        # Route token-usage events through the loop's journal, attaching
+        # a ruble cost when the model has a known price (see agent/pricing.py).
+        from .pricing import cost_rub as _cost_rub
+        def on_usage(u):
+            ev = {"event": "TOKEN_USAGE", "iter": context.iteration,
+                  "model": self._model,
+                  "input": u["input"], "output": u["output"],
+                  "total": u["total"]}
+            c = _cost_rub(self._model, u["input"], u["output"])
+            if c is not None:
+                ev["cost_rub"] = round(c, 6)
+            context.on_event(ev)
         driver = ReActDriver(
             backend=_GigaChatBackend(bound, max_retries=self._max_retries,
                                      on_usage=on_usage),

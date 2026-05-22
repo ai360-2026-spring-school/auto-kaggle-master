@@ -97,7 +97,7 @@ class ReActDriver:
         backend: Backend,
         tools: list[ToolSpec],
         context: ToolContext,
-        max_tool_calls: int = 15,
+        max_tool_calls: int = 64,
         max_wallclock_sec: float = 900.0,
     ) -> None:
         self._backend = backend

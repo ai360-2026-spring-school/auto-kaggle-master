@@ -104,7 +104,7 @@ _STRATEGIC_EVENTS = {"BASELINE", "PROPOSE", "RESULT", "ACCEPT", "EVAL_ERROR",
                      "AGENT_ERROR", "REACT_TIMEOUT"}
 
 
-def _strategic_journal(journal_tail: list[dict], last_n: int = 25) -> list[dict]:
+def _strategic_journal(journal_tail: list[dict], last_n: int = 32) -> list[dict]:
     """Filter the journal to STRATEGIC events only and keep the last `last_n`.
 
     Without this filter, TOOL_CALL/TOOL_RESULT/TOKEN_USAGE noise from a single

@@ -34,15 +34,18 @@ LOCKED_CATBOST_PARAMS: dict = {
 
 @dataclass
 class Budget:
-    """Budgets that keep the autonomous loop bounded and experiments fair."""
-    max_iterations: int = 25          # agent edit/evaluate cycles
-    max_seconds_total: float = 60 * 60
-    max_seconds_per_eval: float = 60 * 15
+    """Budgets that keep the autonomous loop bounded and experiments fair.
+
+    Defaults mirror `config.yaml`. CLI flags on `run.py` override per-run.
+    """
+    max_iterations: int = 100         # agent edit/evaluate cycles
+    max_seconds_total: float = 36000  # 10h overnight cap
+    max_seconds_per_eval: float = 3600
     cv_folds: int = 5
     cv_repeats: int = 1
     # An experiment must beat the incumbent by at least this (relative to the
     # metric's std across folds) to be accepted. Prevents chasing CV noise.
-    min_improvement_sigmas: float = 0.15
+    min_improvement_sigmas: float = 0.1
 
 
 @dataclass

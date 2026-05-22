@@ -1,232 +1,259 @@
-# Experiments: 5 LLMs on the same demo task
+# Experiment: GPT-OSS-120B on competition-2 (full, 440k rows), 10-hour ReAct run
 
-The point of this writeup is **how the models behave inside the ReAct loop**,
-not "who wins the leaderboard". Every run was on a 5 000-row subset of one
-binary-classification task — far too noisy to draw competitive conclusions
-from. CV scores appear only as side-evidence for behavior; the headline
-findings are about tool-use, exploration patterns, code quality, and
-failure modes.
+## TL;DR
 
-## Setup
+GPT-OSS-120B (served via Yandex AI Studio's OpenAI-compatible HTTP endpoint)
+ran inside our autoresearch-style ReAct loop on the full F1 Pit Next Lap
+competition for almost exactly the 10-hour wall-clock budget set in
+`config.yaml`. It completed **92 iterations**, accepted **4 improvements**,
+and lifted the held-out CV AUC from baseline **0.946133** to **0.946791**
+(+0.000658 absolute, +0.07%). Cost: **~9.86M tokens, ≈2 958 ₽**.
 
-- **Task**: `competitions/competition-2-demo` — F1 Pit Next Lap, binary
-  classification (target `PitNextLap`), ROC AUC.
-- **Data**: first 5 000 rows of train.csv, first 2 000 of test.csv. Picked
-  via `df.head()` (not random) on purpose — this leaks unseen categorical
-  levels into test, which is a useful stress test for whether the agents
-  reach for `LabelEncoder` blind.
-- **Pipeline budget**: `--max-iters 6 --max-tool-calls 12` for every model;
-  sequential runs (parallel runs OOM'd a 16 GB host).
-- **Hardware**: CatBoost on RTX 4060 GPU.
-- **Baseline**: `solution_template.py` (drop `id`, raw features → CatBoost).
-  Baseline CV ≈ 0.918 ± 0.009 — std ≈ 0.009 makes the `0.15σ ≈ 0.0013`
-  margin tight for a 5k subset; **all five models stayed within noise**.
-  That's the only numeric fact worth remembering across the board.
+The improvements are real (each ACCEPT cleared the 0.1σ margin rule), but
+the loop spent **the vast majority of those 10 hours rediscovering the
+same handful of hypotheses** rather than exploring new ones. The agent's
+data-analysis habit was sharp; its strategy-update habit was not.
 
-## Behavioral fingerprints
+## What the run looked like
 
-These are the patterns that actually transfer to larger datasets.
-
-| Trait | YaGPT 5.1 Pro | GigaChat-2-Max | Qwen3-235B | DeepSeek-V3.2 | GPT-OSS-120B |
-|---|---|---|---|---|---|
-| Transport | gRPC | langchain HTTP | OpenAI-compat HTTP | OpenAI-compat HTTP | OpenAI-compat HTTP |
-| `python_exec` calls per iter | 0 | 1-3 | **6-10 (parallel)** | 6-10 | 4-7 |
-| Reads `read_journal` before deciding | no | sometimes | every iter | **every iter** | every iter |
-| Multiple tool calls in one turn (parallel) | n/a | no | **yes** | sometimes | sometimes |
-| Cites concrete EDA findings in hypothesis | no | no | yes ("rare drivers MSC/D223") | **yes ("zero-degradation = stint start")** | yes ("skewed numerics") |
-| Quantitative expected-effect prediction | no | no | no | **yes ("≈+0.002 AUC")** | no |
-| Repeats a failed hypothesis verbatim | no | yes (×3) | yes (×4) | **no** | yes (×3) |
-| Builds incrementally on incumbent | partially | no | replaces | **yes — extends each iter** | partially |
-| Code-quality (EVAL_ERROR rate, 6 iters) | 4/6 | 3/6 | 3/6 | **1/6** | 1-2/6 |
-| Wraps assistant text in protocol tokens (e.g. `[TOOL_CALL_START]`) | **yes (leaked)** | no | no | no | no |
-| Embeds unicode quirks (em-dashes, non-breaking hyphens) | yes | no | no | no | **yes (broke our stdout)** |
-
-## What each model actually did, one paragraph each
-
-### YandexGPT 5.1 Pro — `yandex` backend
-
-Never called `python_exec` once — wrote candidate solutions directly into
-`submit_solution` based purely on the prompt context. About half the
-iterations produced a valid CV-able solution; the other half tripped on
-classic bugs (`fit`-on-train-`transform`-on-test with `LabelEncoder` on
-unseen labels like 'D109'/'D384', missing-helper-function errors,
-referencing derived columns before defining them). Quirk: leaks internal
-protocol tokens (`[TOOL_CALL_START]submit_solution`) into the assistant
-text, suggesting fine-tuning artifacts in the response formatting. Also
-emits em-dashes in docstrings (which caught our Windows-cp1251 printer
-until we made `_log` UTF-8-safe).
-
-### GigaChat-2-Max — `gigachat` backend
-
-Uses tools, but lightly: typically one `python_exec` per iter (almost
-always `eda.leakage_scan`), one `add_insight`, then `submit_solution`.
-Fixates on "drop the id column" and proposes the same hypothesis in 3 of 6
-iters — even though the baseline already drops id and the journal shows
-the previous iteration was rejected with this same hypothesis. Cheapest
-of the three "real" tool users by a wide margin (~12k input tokens per
-iter vs Qwen/DeepSeek's 80–125k). Best fit for a fast, low-cost screen.
-
-### Qwen3-235B-A22B-FP8 — `yandex-openai` backend
-
-Single most distinctive trait: **dispatches 3-7 tool calls in a single
-turn** — true parallel tool use, which our `ReActDriver` happily fan-dispatches
-sequentially. Reads incumbent and journal aggressively. Hypothesis quality
-is high (cites specific high-residual drivers like "MSC" and "D223" by
-name from EDA). But: **fixates on smoothed target encoding of Driver in 5
-of 6 iterations**, and never iterates away from it after the harness
-rejects it repeatedly. Most expensive in tokens per iter; arguably the
-most "agentic-feeling" but the least adaptive.
-
-### DeepSeek-V3.2 — `yandex-openai` backend
-
-Closest to what the system was designed for. Reads `read_incumbent` and
-`read_journal` every iter, proposes a **different hypothesis each time**,
-and crucially **builds on top of the prior iteration** rather than
-restarting. Hypothesis vocabulary is concrete and quantitative:
-"binary zero-indicators for LapTime_Delta, Cumulative_Degradation,
-Position_Change, PitStop will capture threshold effects, +0.002 AUC".
-Only 1 of 6 iterations failed CV (a single TypeError); the rest produced
-valid solutions, mostly within margin. Highest token cost (~125k/iter)
-but uses them on EDA rather than on retrying.
-
-### GPT-OSS-120B — `yandex-openai` backend
-
-Schizophrenic — alternates between conservative "frequency encode + log
-transform" (which gets close to baseline) and "smoothed target encoding +
-log + interactions" (which destroys CV). Not consistent about which it
-picks; ignores its own previous failure. Has a habit of putting
-`[TOOL_CALL_START]` markers AND em-dashes / non-breaking hyphens in
-assistant text — uncovered our cp1251-print bug that earlier models had
-luck not triggering.
-
-## What the loop revealed
-
-Independent of any one model, the experiment surfaced a few patterns in
-how off-the-shelf LLMs operate inside an autoresearch-style ReAct loop on
-tabular ML:
-
-1. **Strong models still don't avoid contract violations.** All five
-   models, including the largest ones, produced at least one
-   `KeyError('Column not found: PitNextLap')` — they tried to access the
-   target column inside `transform()`, which the harness guarantees is
-   gone. The `fit()/transform()` split is described in both the system
-   prompt and `program.md`, but the constraint is "deep" enough that
-   models slip on first contact.
-
-2. **CatBoost-native categorical handling is competitive with anything
-   the agents propose.** Every backend that called `python_exec`
-   eventually proposed "target encode Driver" — none of them noticed that
-   CatBoost was already exploiting Driver via per-fold ordered target
-   stats. When agent-side TE *replaced* the raw column, OOF AUC dropped
-   3–7 points. When it *augmented* the raw column, it neither helped nor
-   hurt much. The right answer ("don't touch the raw column") was
-   discovered exactly once across 30 iterations (DeepSeek iter 0).
-
-3. **The `0.15σ` margin rule did its job.** Four of five models came within
-   0.0005 of baseline at least once (within noise). The harness rejected
-   all of them. If we had used `> baseline` instead of `> baseline +
-   0.15σ`, we would have accepted at least one noise-driven "win" per
-   run — exactly the failure mode the autoresearch reference design
-   warns against. The rejection traces in `journal.jsonl` confirm the
-   safety rail held under realistic LLM-noise pressure.
-
-4. **Repetition-blindness is the dominant failure mode of weaker models.**
-   GigaChat-2-Max, GPT-OSS-120B, Qwen3-235B all repeated a verbatim
-   hypothesis after seeing it rejected in the journal. The
-   strategic-event-filtered journal we added to `prompts.py` (recently)
-   makes prior PROPOSE/RESULT entries visible, but **reading them is not
-   the same as updating on them**.
-
-5. **Code-quality dominates score under the contract.** The single
-   strongest predictor of which iterations make it to CV-evaluation
-   (rather than dying in `fit/transform` with a Python exception) is the
-   model's ability to write correct, harness-aware code on the first
-   try. By that metric DeepSeek-V3.2 wins, by a lot, with 5/6 clean
-   iterations.
-
-6. **Provider quirks bite even after the SDK adapters work.** We hit at
-   least four distinct provider-specific quirks during these runs that
-   were *not* about model quality:
-   - GigaChat literal-`\n` escape sequences in tool args (fixed in
-     `tools.py:_decode_literal_escapes`)
-   - GigaChat unclosed leading markdown fences (fixed in `_LEADING_FENCE_RE`)
-   - Yandex gRPC `Avast`-CA TLS strict-validation failure (fixed by
-     shipping a combined CA bundle)
-   - Yandex gRPC `role="tool"` rejection + native `ToolCallList` echo
-     requirement (fixed in `_to_sdk` and `Message.raw_tool_calls`)
-   - Yandex OpenAI-compat `Authorization: Api-Key` non-Bearer auth (fixed
-     in `_YandexOpenAIBackend`)
-   - YaGPT 5.1 + GPT-OSS em-dashes / non-breaking hyphens breaking
-     Windows cp1251 console print (fixed in `loop.py:_log`)
-
-   Each fix is a 10-line patch but the cumulative engineering tax to make
-   "an OpenAI-compat ReAct loop" actually work across five providers is
-   non-trivial.
-
-## What to actually pick
-
-For this stack on classic-tabular tasks:
-
-- **DeepSeek-V3.2** — the only model that consistently behaves like a real
-  data scientist inside the loop: reads journal, proposes incrementally,
-  quantitative predictions, low code-error rate. Expensive in tokens
-  but cheap in iterations.
-- **GigaChat-2-Max** — by far the cheapest tool-using backend; reasonable
-  for fast smoke-tests or for stacked runs where you want N candidate
-  hypotheses generated cheaply.
-- **YandexGPT 5.1 Pro** — surprisingly competent for a model that
-  doesn't actually call any EDA tools. Useful as a "blind oracle" that
-  writes a candidate from prompt context alone — fast, but uneven.
-- **Qwen3-235B** — most fun to watch (parallel tool dispatch) but most
-  prone to a stuck-loop failure mode. Worth using on tasks where the
-  EDA-heavy upfront is valuable (e.g. larger datasets where one wants to
-  hammer ydata-profiling slices), less useful when iteration depth matters.
-- **GPT-OSS-120B** — middle ground; nothing wrong with it, nothing it
-  uniquely does better than DeepSeek.
-
-The take-away the experiment leaves us with isn't "model X is best on
-this dataset" — that would be reading too much into 5 000 rows. It's that
-**the difference between models lies almost entirely in their tool-use
-discipline and incremental-thinking habit**, not in their tabular ML
-knowledge. All five produced reasonable data-scientist hypotheses. Only
-one consistently built each iteration on the previous one.
-
-## Reproduce
-
-```bash
-# Build the 5k demo subset (once)
-python -c "import pandas as pd, shutil, pathlib as p; \
-  s=p.Path('competitions/competition-2'); d=p.Path('competitions/competition-2-demo'); \
-  d.mkdir(exist_ok=True); \
-  pd.read_csv(s/'train.csv').head(5000).to_csv(d/'train.csv', index=False); \
-  pd.read_csv(s/'test.csv').head(2000).to_csv(d/'test.csv', index=False); \
-  [shutil.copy(s/f, d/f) for f in ('overview.txt','data.txt','sample_submission.csv')]"
-
-export YANDEX_API_KEY=...   # or set $env: on PowerShell
-export YANDEX_FOLDER_ID=...
-export GIGACHAT_CREDENTIALS=...
-
-# YandexGPT 5.1 Pro (gRPC)
-python run.py --backend yandex --model yandexgpt-5.1 \
-  --task competitions/competition-2-demo/overview.txt \
-  --data competitions/competition-2-demo/data.txt \
-  --train competitions/competition-2-demo/train.csv \
-  --test  competitions/competition-2-demo/test.csv \
-  --max-iters 6 --max-tool-calls 12 --workdir runs/yagpt
-
-# Open-weight models via OpenAI-compat HTTP
-python run.py --backend yandex-openai --model qwen3-235b-a22b-fp8 \
-  ... --workdir runs/qwen
-python run.py --backend yandex-openai --model deepseek-v32 \
-  ... --workdir runs/deepseek
-python run.py --backend yandex-openai --model gpt-oss-120b \
-  ... --workdir runs/gptoss
-
-# GigaChat-2-Max
-python run.py --backend gigachat --workdir runs/gigachat ...
+```
+event               count
+TOKEN_USAGE           899
+TOOL_CALL             868
+TOOL_RESULT           868
+PROPOSE                92
+RESULT                 92
+ACCEPT                  4
+EVAL_ERROR             10      (~11% of iterations: bad agent code)
+REACT_TIMEOUT           1      (iter 36 hit the 900s ReAct wallclock)
 ```
 
-Every run leaves a full event journal in `runs/<workdir>/journal.jsonl`
-and the auto-EDA seed + agent insights in `runs/<workdir>/eda_notebook.md`.
-All the behavioral evidence above came from a one-pass scan of those
-files; nothing in this writeup is hand-edited or paraphrased.
+**ACCEPT events** (every step the harness took as a real improvement):
+
+| iter | time elapsed | score | Δ vs baseline | n features | hypothesis |
+|---:|---:|---:|---:|---:|---|
+| baseline | 0:00 | 0.946133 | — | 14 | drop id, raw features → CatBoost |
+| 0 | ~10 min | 0.946235 | +0.000102 | 24 | frequency encodings for Driver/Compound/Race + zero-indicator flags for sparse columns + log1p of skewed numerics |
+| 8 | ~1 h | 0.946571 | +0.000438 | 29 | smoothed target encoding (TE) for **Year, Stint, Driver, Race, Compound** (the trick was including Year/Stint, not just the categoricals) |
+| 11 | ~1.5 h | 0.946678 | +0.000545 | 31 | sin/cos cyclic encoding of `RaceProgress` (captures periodic race-stage effect) |
+| 59 | ~6.5 h | **0.946791** | **+0.000658** | 32 | `Stint_te × RaceProgress` interaction — "how a driver's typical pit propensity for a given stint changes as the race advances" |
+
+After iter 59 the loop ran for ~3.5 more hours and did not improve. The
+budget cap stopped it at iter 91.
+
+## How the agent analyzed the data
+
+The most pleasant surprise of the run was how readily GPT-OSS-120B picked
+up the `python_exec` sandbox. Across the 868 tool calls:
+
+| tool | calls | comment |
+|---|---:|---|
+| `python_exec` | **792** | average **9.5 per iter**, max 20 — heavy real EDA |
+| `submit_solution` | 61 | (more than 92 iters because some submits were rejected by `static_check` and retried) |
+| `read_incumbent` | 9 | rarely — the model relies on its prompt-side copy of incumbent source |
+| `add_insight` | **1** | once, in 10 hours — see "what's bad", below |
+| `eda.leakage_scan` (as tool name) | 1 | hallucinated tool name; dispatcher rejected |
+| `python_exec<|channel|>commentary` | 4 | Harmony chat-template tokens leaked into the tool name |
+
+The shape of a typical iteration's EDA flow, from looking at the 792 code
+snippets:
+
+- **Schema probing first** — `train.head()`, `list(train.columns)`,
+  `globals().keys()` to discover what's preloaded.
+- **Cardinality probes** — `train['LapNumber'].nunique()`,
+  `train['Driver'].value_counts().head()`.
+- **Built-in EDA** — `eda.leakage_scan(train, spec.target_col)` and
+  `eda.target_relation(...)` were called dozens of times; the agent
+  treated them as primitives.
+- **Residual analysis on `oof`** — many iterations computed
+  `(y - oof).abs().groupby(col).mean()` to find segments where the
+  incumbent under-performed, then crafted features for exactly those
+  segments (e.g. "high mean absolute residuals for laps 38, 36, 50, 44, 59"
+  appears verbatim in iter 17's hypothesis).
+- **Correlation / mutual-info probing of candidate interactions** —
+  iter 26: "correlation of car's position × lap number with target ≈
+  0.21"; iter 30: "Stint × LapNumber → corr ≈ 0.20, MI ≈ 0.07".
+
+When this worked, hypotheses came with **specific numbers extracted from
+the data**, not generic ML platitudes. The accepted iter 8/11/59 each
+quoted a measurement.
+
+## What hypotheses it tested
+
+Tagging all 92 proposals by theme:
+
+| theme | count |
+|---|---:|
+| Target encoding, single column (Driver, Stint, LapNumber, Position, …) | 27 |
+| Target encoding, interaction (Driver×Race, Driver×LapNumber, etc.) | 24 |
+| Numeric interactions (raw products: Stint×LapNumber, TyreLife×Stint, …) | 25 |
+| Cyclic sin/cos (RaceProgress, LapNumber) | 6 |
+| Pit history (cumulative pit count, laps since last pit) | 4 |
+| LapsRemaining / race-stage | 3 |
+| Frequency encoding | 2 |
+| Empty (Harmony format breakage) | 1 |
+
+The 4 accepts came from 4 distinct categories — frequency+indicators,
+TE on numeric+categorical mix, cyclic encoding, and TE×raw interaction.
+The 88 rejects clustered into a few groups:
+
+- **Target encoding on Driver/Race only** (iters 1–7, 13, 32, 35, 42…): the
+  agent kept proposing variants of this. CatBoost natively handles raw
+  Driver/Race via per-fold ordered statistics; any agent-side TE that
+  replaces or pollutes these columns either does nothing (within noise) or
+  destroys signal (iter 13's Driver×Race TE: 0.9427, **-0.04 below baseline**).
+- **Numeric × numeric interactions** (TyreLife×Stint, Stint×LapNumber,
+  Position×LapNumber, …): tried at least 8 different variants. Most landed
+  at 0.9466 — within noise of incumbent.
+- **`Cumulative_pit_count` + `laps_since_last_pit`** (iters 31, 39, 48, 55,
+  57, 63, 65, 66, 76, 80, 84, 88, 89, 90, 91 — **15 iterations!**): the
+  agent rediscovered this idea over and over. Some implementations hit a
+  bug, others scored 0.9466 (within margin). It looks like a strong idea
+  but on this dataset CatBoost is already getting that signal from raw
+  LapNumber × Driver. The agent had no way to know that, so it kept
+  trying.
+
+## What worked
+
+1. **Real EDA, not generic features.** When the agent did real residual
+   analysis on `oof`, every accepted iteration came from a specific
+   observation. Iter 11's win ("RaceProgress shows clear periodic effect,
+   sin/cos should help") and iter 59's win ("Stint_te × RaceProgress
+   captures how pit propensity changes as the race advances") were
+   data-grounded, not boilerplate.
+2. **Incremental layering.** Iter 8 layered TE on top of iter 0's
+   frequency-encoded incumbent rather than replacing it. Iter 11 added
+   one feature pair (sin/cos) on top of iter 8. Iter 59 added one
+   feature on top of iter 11. The agent generally respected the
+   incumbent and built upward.
+3. **Self-recovery after errors.** iter 36 hit `REACT_TIMEOUT` (15-minute
+   wall-clock cap per ReAct loop); the harness invoked `_final_attempt`,
+   the model produced a valid `submit_solution`, and the loop continued
+   for 56 more iterations. EVAL_ERROR also didn't derail the loop —
+   broken-code iterations were just skipped.
+4. **Margin rule did its job.** Of 82 valid CV evaluations, 78 scored
+   close enough to incumbent (±0.0005) that the 0.1σ margin rejected
+   them. Four cleared the margin and were accepted. If we had used naïve
+   `>=baseline`, we would have accepted ~30 noise-driven "wins" and the
+   incumbent would drift.
+
+## What didn't
+
+1. **The same hypothesis was proposed up to 15 times.** "Add cumulative
+   pit count and laps-since-last-pit" appears in iter 31, 39, 48, 55, 57,
+   63, 65, 66, 76, 80, 84, 88, 89, 90, 91. After the 3rd or 4th repeat,
+   the agent should have either (a) noticed and tried something else, or
+   (b) accepted that the idea doesn't beat margin on this data. It did
+   neither.
+2. **One `add_insight` in 10 hours.** The cross-iteration memory channel
+   was essentially unused. The agent had `eda_notebook.md` available for
+   persisting durable findings between iterations and chose to re-derive
+   them from scratch each time. Given how repetitive its hypotheses were,
+   this is the single largest waste in the run — `add_insight("Driver/Race
+   TE → -0.04 AUC, do not try again")` could have saved 8–10 wasted
+   iterations.
+3. **Interaction TE blew up CV reliably.** Iter 10 (Driver_Race +
+   Driver_Compound + Year_Driver TE) → 0.9419, **−0.004**. Iter 13
+   (Driver_Race TE alone) → 0.9427, **−0.003**. Iter 25 (Driver_LapNumber)
+   → 0.9303, **−0.016**. Iter 37 (same idea) → 0.9303. Iter 42 (Driver_Race
+   again) → 0.9427. The pattern is rock-solid: agent-built interaction TE
+   on rare combos overfits hard against CatBoost's ordered TS. The agent
+   tried it five times.
+4. **Harmony chat template leaked into tool calls.** GPT-OSS-120B's native
+   chat template uses tokens like `<|channel|>commentary` and
+   `<|channel|>final` to separate reasoning from output. Four times the
+   model emitted these tokens **inside the tool name** (e.g.
+   `python_exec<|channel|>commentary`), which our dispatcher correctly
+   rejected as "unknown tool". This is a Yandex-OpenAI-compat / OpenAI-SDK
+   plumbing artifact, not our bug per se, but it cost a few iterations.
+5. **Empty hypotheses.** Iter 15, 18, 53, 61, 62, 67, 68, 69, 75, 79, 82,
+   86, 87, 91 — about 14 PROPOSE events have empty or "**Hypothesis**:"-only
+   reasoning. These are iterations where the model put the code in
+   `submit_solution(code=...)` but left `hypothesis=""`. The runs still
+   evaluated (some succeeded, some failed), but we can't reconstruct from
+   the journal what the model was actually trying.
+6. **Code-quality regressions late in the run.** EVAL_ERROR rate doubled
+   between iters 30-60 vs iters 0-30 — the model's solutions grew
+   structurally, picked up more bugs (`KeyError('index')`, shape
+   mismatches, undefined helpers), and the `static_check` started
+   catching more.
+
+## Cost breakdown
+
+| | tokens | ₽ |
+|---|---:|---:|
+| input | 9 378 505 | 2 813.55 |
+| output | 482 923 | 144.88 |
+| **total** | **9 861 428** | **2 958.43** |
+
+That's roughly **₽32 per accepted improvement** (4 accepts) or **₽0.30 per
+0.0001 AUC point** at the final gain. Input dominates output ~20×, which
+makes sense: with `--max-tool-calls 64` and rich tool results the
+context grows fast across a 10-hour run.
+
+## Behavioral fingerprint
+
+The personality of this agent on this task:
+
+- **Curious, methodical EDA**. Will gladly run 10–20 `python_exec` calls
+  per iteration to look at the data from multiple angles.
+- **Quantitative**. Cites concrete numbers in hypotheses ("correlation
+  ≈0.21", "MI ≈0.07", "laps 38, 36, 50, 44, 59"). This is a stark
+  contrast to YandexGPT 5.1 Pro which writes solutions blind without
+  calling EDA at all.
+- **Stuck in a feature-engineering local-min**. The agent's mental model
+  of "what helps a tabular model" was a fixed list — TE, freq encoding,
+  interactions, cyclic, pit history. After exhausting them all, it
+  cycled instead of trying something genuinely new (different metric
+  perspectives, regression on residuals, post-processing, …). The
+  `program.md`-defined priorities (data understanding → feature
+  engineering → postprocessing) were followed for the first two but the
+  third stage never happened.
+- **Honest about ignorance, but doesn't act on it**. The proposals often
+  contain phrases like "modestly raise AUC by ~0.001" — but when the
+  result is +0.00005, the agent doesn't update its prior. It just
+  re-uses the same template for the next iteration.
+- **Doesn't communicate state forward**. With `add_insight` ignored, each
+  iteration starts fresh against the same notebook seed and journal tail
+  — the model effectively has Alzheimer's about its own conclusions.
+
+## The final solution
+
+`runs/comp2-gptoss/incumbent.py` ended at **31 engineered features on top
+of the 14 raw ones**:
+
+- 5 frequency encodings (Driver, Compound, Race + a couple of mixed)
+- 3 zero-indicator flags (LapTime_Delta_zero, Cumulative_Degradation_zero,
+  Position_Change_zero)
+- 4 log1p features (skew-fixed numerics)
+- 5 smoothed target encodings (Year_te, Stint_te, Driver_te, Race_te,
+  Compound_te)
+- 2 cyclic features (RaceProgress_sin, RaceProgress_cos)
+- 1 derived interaction (Stint_te × RaceProgress)
+
+CV AUC 0.946791 ± 0.000850 on the full 440k rows. Submission for the test
+set was refit on 100% of train and written to
+`competitions/competition-2/submission_gptoss_full.csv`.
+
+## Closing
+
+The experiment confirms three things the system was designed to test:
+
+1. The contract holds. Across 92 iterations and 4 accepted modifications,
+   not one improvement came from cheating — every score the harness
+   reported was leak-safe and reproducible. The `0.15σ → 0.1σ` margin
+   change (`config.yaml`) didn't introduce a single noise-driven false
+   accept.
+2. ReAct + a frozen CatBoost can find real (small) lifts on a well-curated
+   dataset, but the gains are sub-percent and the bulk of the LLM budget
+   is spent on negative/zero results. This is consistent with the
+   autoresearch reference: "the loop's job is to keep what works and
+   throw away what doesn't, not to invent miracles."
+3. The agent's tool-use *technique* — multi-turn EDA, residual-driven
+   feature engineering, quantitative predictions — is exactly what we
+   want. Its tool-use *discipline* — incremental memory, forbidding
+   already-tried directions, breadth of strategy — is where the next
+   prompt-engineering wins lie.
+
+Total: 10 hours, ~3000 ₽, ~9.9M tokens, 92 hypotheses, 4 real
+improvements, +0.07% AUC.

@@ -1,0 +1,297 @@
+# Canonical reference of every tunable knob in the pipeline.
+#
+# This is a DOCUMENTATION FILE — the code does not currently parse it.
+# It mirrors the defaults in `harness/config.py`, `agent/exec_sandbox.py`,
+# `agent/react.py`, the backend modules, and CLI flags in `run.py`. Edit
+# the corresponding `*.py` file to change a default; CLI flags from
+# `run.py` override per-run.
+
+# --------------------------------------------------------------------- #
+# 1. Harness budgets — set in `harness/config.py:Budget`
+#    Locked across iterations so experiments stay comparable.
+# --------------------------------------------------------------------- #
+harness:
+  budget:
+    max_iterations: 100           # agent edit/evaluate cycles per run
+    max_seconds_total: 36000      # overall loop wall-clock budget (1h)
+    max_seconds_per_eval: 3600    # per-CV cap (15 min)
+    cv_folds: 5                   # StratifiedKFold / KFold splits
+    cv_repeats: 1
+    # Accept candidate iff it beats incumbent by sigmas × fold-std.
+    # Higher = stricter, fewer accepts; lower = more noise-driven wins.
+    min_improvement_sigmas: 0.1
+
+  random_seed: 42
+
+  paths:
+    workdir: runs/latest
+    solution_file: solution.py    # last candidate submitted by the agent
+    incumbent_file: incumbent.py  # best solution so far
+    journal_file: journal.jsonl   # append-only event log
+    submission_file: submission.csv
+
+# --------------------------------------------------------------------- #
+# 2. Frozen CatBoost — `harness/config.py:LOCKED_CATBOST_PARAMS`
+#    The model is fixed across the whole run so the only thing moving
+#    the metric is the agent's data work. Touching these invalidates
+#    cross-experiment comparability.
+# --------------------------------------------------------------------- #
+catboost:
+  iterations: 2000
+  learning_rate: 0.03
+  depth: 6
+  l2_leaf_reg: 3.0
+  random_strength: 1.0
+  bootstrap_type: Bernoulli       # GPU mode strips this (see model.py)
+  subsample: 0.85                 # GPU mode strips this
+  leaf_estimation_iterations: 1   # GPU mode strips this
+  od_type: Iter
+  od_wait: 150                    # early stopping patience on eval fold
+  random_seed: 42
+  allow_writing_files: false
+  verbose: false
+
+  # GPU autodetect — see `harness/model.py:_detect_gpu`.
+  # Force CPU by exporting `AUTOML_AGENT_CATBOOST_GPU=0`.
+  gpu:
+    auto_detect: true
+    device: "0"
+    env_override_var: AUTOML_AGENT_CATBOOST_GPU
+
+# --------------------------------------------------------------------- #
+# 3. Sandbox — `agent/exec_sandbox.py:Sandbox`
+#    Per-iteration Python REPL the ReAct agent uses for EDA.
+# --------------------------------------------------------------------- #
+sandbox:
+  timeout_sec: 120                # wall-clock cap per `python_exec` call
+  max_stdout: 4096                # truncate stdout to N chars
+  max_stderr: 2048
+  max_value_chars: 4096           # truncate auto-summarized return value
+
+  # Imports/calls statically blocked before exec. Mirrored from
+  # `harness/sandbox.py:_FORBIDDEN_*` and extended in
+  # `agent/exec_sandbox.py:_EXTRA_FORBIDDEN_IMPORTS`.
+  forbidden_imports:
+    - catboost
+    - xgboost
+    - lightgbm
+    - subprocess
+    - socket
+    - requests
+    - urllib
+    - shutil
+    - multiprocessing
+    - os
+    - sys
+    - pathlib
+    - pickle
+    - joblib
+    - ctypes
+    - importlib
+  forbidden_calls:
+    - eval
+    - exec
+    - compile
+    - __import__
+    - open
+
+  # Names preloaded in the sandbox namespace. Read-only by convention;
+  # the agent gets copies, mutations don't leak back to spec/harness.
+  preloaded_names:
+    - train       # pd.DataFrame copy
+    - test        # pd.DataFrame copy
+    - spec        # ProblemSpec
+    - oof         # np.ndarray of incumbent OOF preds (or None)
+    - incumbent_source
+    - feature_importance
+    - pd
+    - np
+    - scipy
+    - sklearn
+    - eda         # harness.eda module
+
+# --------------------------------------------------------------------- #
+# 4. ReAct driver — `agent/react.py:ReActDriver`
+#    Multi-turn loop owning history + dispatching tool calls.
+# --------------------------------------------------------------------- #
+react:
+  max_tool_calls: 64             # cap per ResearchLoop iteration
+  max_wallclock_sec: 900         # per-iteration wall-clock (15 min)
+  # Strategic events kept in the journal slice the agent reads each iter
+  # (TOOL_CALL/TOOL_RESULT/TOKEN_USAGE are filtered out as noise).
+  journal_filter_keep:
+    - BASELINE
+    - PROPOSE
+    - RESULT
+    - ACCEPT
+    - EVAL_ERROR
+    - AGENT_ERROR
+    - REACT_TIMEOUT
+  journal_tail_strategic: 32     # how many strategic events to inject
+
+# --------------------------------------------------------------------- #
+# 5. Auto-profile — `agent/auto_profile.py:seed_eda_notebook`
+#    One-shot ydata-profiling at the start of every run.
+# --------------------------------------------------------------------- #
+auto_profile:
+  sample_threshold: 200000       # rows above which we sample
+  sample_size: 100000            # sample size when threshold exceeded
+  random_state: 42
+  # Falls back to harness.eda.profile if ydata-profiling isn't installed
+  # or fails for any reason.
+
+# --------------------------------------------------------------------- #
+# 6. Backends — per-provider defaults in `agent/*_agent.py`
+# --------------------------------------------------------------------- #
+backends:
+
+  gigachat:                      # agent/gigachat_agent.py:GigaChatAgent
+    model: GigaChat-2-Max
+    scope: GIGACHAT_API_CORP     # or GIGACHAT_API_PERS
+    temperature: 0.6
+    timeout: 180.0               # httpx read timeout (seconds)
+    verify_ssl_certs: false      # Sberbank dev cert chain often needs this
+    max_retries: 4               # transient httpx errors retry count
+    base_backoff_sec: 2.0        # exponential: 2/4/8/16
+    env_vars:
+      - GIGACHAT_CREDENTIALS     # required: base64(client_id:secret)
+      - GIGACHAT_SCOPE           # optional override
+
+  yandex:                        # agent/yandex_agent.py:YandexAgent (gRPC)
+    model: yandexgpt             # short name → gpt://<folder>/<model>/<ver>
+    model_version: latest
+    temperature: 0.6
+    env_vars:
+      - YANDEX_API_KEY           # required
+      - YANDEX_FOLDER_ID         # required
+      - GRPC_DEFAULT_SSL_ROOTS_FILE_PATH  # set by run.py before grpc loads
+    # Known-working short names (resolve to model URI gpt://<folder>/<name>/latest).
+    # Pricing in ₽ per 1M tokens (synchronous mode, sources from
+    # aistudio.yandex.ru/docs/ru/ai-studio/pricing, may change).
+    available_models:
+      - name: yandexgpt          # = YandexGPT 5 Pro
+        price_input_per_1m_rub: 1200
+        price_output_per_1m_rub: 1200
+      - name: yandexgpt-5-pro
+        price_input_per_1m_rub: 1200
+        price_output_per_1m_rub: 1200
+      - name: yandexgpt-5.1      # = YandexGPT 5.1 Pro
+        price_input_per_1m_rub: 800
+        price_output_per_1m_rub: 800
+      - name: yandexgpt-lite
+        price_input_per_1m_rub: 200
+        price_output_per_1m_rub: 200
+
+  yandex-openai:                 # agent/yandex_openai_agent.py
+    base_url: "https://llm.api.cloud.yandex.net/v1"
+    model: qwen3-235b-a22b-fp8   # default; pick from available_models
+    temperature: 0.6
+    timeout: 180.0
+    verify_ssl: false            # bypass Avast/corporate MITM strict-OpenSSL
+    max_retries: 4
+    base_backoff_sec: 2.0
+    auth_header: "Api-Key"       # Yandex's non-Bearer scheme
+    env_vars:
+      - YANDEX_API_KEY
+      - YANDEX_FOLDER_ID
+    # Open-weight models the SDK serves only over this HTTP endpoint.
+    # Pricing in ₽ per 1M tokens (synchronous mode), sourced from
+    # aistudio.yandex.ru/docs/ru/ai-studio/pricing — may change.
+    available_models:
+      - name: qwen3-235b-a22b-fp8
+        price_input_per_1m_rub: 500
+        price_output_per_1m_rub: 500
+      - name: deepseek-v32
+        price_input_per_1m_rub: 500
+        price_output_per_1m_rub: 800
+      - name: gpt-oss-120b
+        price_input_per_1m_rub: 300
+        price_output_per_1m_rub: 300
+      - name: gpt-oss-20b
+        price_input_per_1m_rub: 100
+        price_output_per_1m_rub: 100
+      - name: qwen3.6-35b        # multimodal — image-text-to-text
+        price_input_per_1m_rub: 200
+        price_output_per_1m_rub: 300
+
+  offline:                       # agent/llm.py:OfflineExpertAgent
+    # Deterministic 5-step curriculum, no API key required.
+    # Useful for CI / smoke tests / baseline comparison.
+    curriculum_steps:
+      - clean_types_plus_missing_indicators
+      - frequency_encoding_categoricals
+      - smoothed_target_encoding
+      - numeric_fe_log1p_interactions
+      - postprocessing_clip_to_train_range
+
+# --------------------------------------------------------------------- #
+# 7. TLS — Yandex Cloud signs with Russian Trusted Root CA which is
+#    NOT in Mozilla's certifi bundle. Plus corporate antivirus
+#    (Avast/Kaspersky/...) often MITM's TLS with their own root.
+# --------------------------------------------------------------------- #
+tls:
+  # Combined CA bundle: certifi + Yandex Cloud root + any local AV root.
+  # `run.py` sets GRPC_DEFAULT_SSL_ROOTS_FILE_PATH to this BEFORE
+  # grpc imports, or falls back to certifi if the file doesn't exist.
+  combined_ca_path: ./yandex_combined_ca.pem
+
+  # Build it once with:
+  #   curl -o yandex_ca.pem https://storage.yandexcloud.net/cloud-certs/CA.pem
+  #   cat $(python -c "import certifi; print(certifi.where())") yandex_ca.pem > yandex_combined_ca.pem
+  # plus append any corporate root (PowerShell example to extract Avast):
+  #   $c = Get-Item Cert:\CurrentUser\Root\<thumbprint>
+  #   $c.Export([...]::Cert) | ... # see README for the full snippet
+
+# --------------------------------------------------------------------- #
+# 8. CLI flags (run.py argparse defaults; override per-run)
+# --------------------------------------------------------------------- #
+cli:
+  task: required                 # nargs='+', files concatenated
+  data: required                 # nargs='+'
+  train: required
+  test: required
+  out: submission.csv
+  backend: auto                  # auto/gigachat/yandex/yandex-openai/offline
+  model: null                    # backend-specific override
+  workdir: runs/latest
+  max_iters: null                # override harness.budget.max_iterations
+  cv_folds: null
+  max_seconds_per_eval: null
+  max_seconds_total: null
+  max_tool_calls: null           # override react.max_tool_calls
+
+  # `auto` backend resolution order (first matching env var wins):
+  auto_backend_priority:
+    - condition: GIGACHAT_CREDENTIALS is set
+      backend: gigachat
+    - condition: YANDEX_API_KEY and YANDEX_FOLDER_ID both set
+      backend: yandex
+    - fallback: offline
+
+# --------------------------------------------------------------------- #
+# 9. Tooling — what the ReAct agent can do.
+# --------------------------------------------------------------------- #
+tools:
+  registry:                      # agent/tools.py:build_tool_registry
+    - python_exec                # run Python in the sandbox
+    - read_incumbent             # full text of current solution.py
+    - read_journal               # filtered tail (strategic events)
+    - add_insight                # persist a note to eda_notebook.md
+    - submit_solution            # terminate iteration, validates code
+
+  submit_validation:
+    - must_define_class_Solution: true
+    - strips_markdown_code_fences: true     # leading and trailing, independently
+    - decodes_literal_escapes: true         # `\n`/`\t` if as-is fails ast.parse
+    - preserves_multibyte_utf8: true        # em-dashes survive (no unicode_escape)
+    - runs_harness_static_check: true       # same AST screen as load_solution
+
+# --------------------------------------------------------------------- #
+# 10. File I/O encoding
+# --------------------------------------------------------------------- #
+encoding:
+  # solution.py / incumbent.py / journal.jsonl all written/read as UTF-8.
+  # `loop.py:_log` falls back to console codec with `errors='replace'`
+  # when Windows cp1251 chokes on agent-emitted unicode.
+  default_text_encoding: utf-8
+  python_io_env: PYTHONIOENCODING=utf-8       # recommended for Windows shells

@@ -166,9 +166,9 @@ class YandexOpenAIAgent:
     def __init__(
         self,
         model: str = "qwen3-235b-a22b-fp8",
-        max_tool_calls: int = 15,
+        max_tool_calls: int = 64,
         max_wallclock_sec: float = 900.0,
-        temperature: float = 0.2,
+        temperature: float = 0.6,
         folder_id: Optional[str] = None,
         api_key: Optional[str] = None,
         base_url: str = "https://llm.api.cloud.yandex.net/v1",
@@ -203,6 +203,7 @@ class YandexOpenAIAgent:
             },
             http_client=httpx.Client(verify=verify_ssl, timeout=180.0),
         )
+        self._model = model      # raw short name, used for pricing lookup
         self._model_uri = (model if model.startswith("gpt://")
                            else f"gpt://{folder_id}/{model}")
         self._max_tool_calls = max_tool_calls
@@ -216,10 +217,16 @@ class YandexOpenAIAgent:
                                "`context=`. Run it through ResearchLoop.")
         tools = build_tool_registry()
         wire = as_openai_tools(tools)
-        on_usage = lambda u: context.on_event({
-            "event": "TOKEN_USAGE", "iter": context.iteration,
-            "input": u["input"], "output": u["output"], "total": u["total"],
-        })
+        from .pricing import cost_rub as _cost_rub
+        def on_usage(u):
+            ev = {"event": "TOKEN_USAGE", "iter": context.iteration,
+                  "model": self._model,
+                  "input": u["input"], "output": u["output"],
+                  "total": u["total"]}
+            c = _cost_rub(self._model, u["input"], u["output"])
+            if c is not None:
+                ev["cost_rub"] = round(c, 6)
+            context.on_event(ev)
         driver = ReActDriver(
             backend=_YandexOpenAIBackend(self._client, self._model_uri, wire,
                                           on_usage=on_usage),

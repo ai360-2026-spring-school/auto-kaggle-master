@@ -29,7 +29,7 @@ from . import prompts
 
 class ResearchLoop:
     def __init__(self, cfg: HarnessConfig, agent: Agent, program_md_path: str,
-                 use_tool_prompt: bool = True, max_tool_calls: int = 15):
+                 use_tool_prompt: bool = True, max_tool_calls: int = 64):
         self.cfg = cfg
         self.agent = agent
         self.program_md = prompts.load_program_md(program_md_path)

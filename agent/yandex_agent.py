@@ -22,12 +22,14 @@ from .tools import ToolContext, build_tool_registry
 
 
 class _YandexBackend:
-    def __init__(self, model_obj, sdk_tools: list) -> None:
+    def __init__(self, model_obj, sdk_tools: list,
+                 on_usage: Optional[Any] = None) -> None:
         # `sdk_tools` is a list of `FunctionTool` proto-wrapped objects
         # built via `sdk.tools.function(...)`. Plain dicts cause
         # `'dict' object has no attribute '_to_proto'` inside the SDK.
         self._model = model_obj
         self._sdk_tools = sdk_tools
+        self._on_usage = on_usage
 
     def invoke(self, messages: list[Message]) -> AssistantMessage:
         sdk_messages = [_to_sdk(m) for m in messages]
@@ -40,7 +42,25 @@ class _YandexBackend:
             elif hasattr(model, "configure"):
                 model = model.configure(tools=self._sdk_tools)
             result = model.run(sdk_messages)
+        self._record_usage(result)
         return _from_sdk(result)
+
+    def _record_usage(self, result) -> None:
+        if self._on_usage is None:
+            return
+        usage = getattr(result, "usage", None)
+        if usage is None:
+            return
+        # Yandex CompletionUsage: input_text_tokens, completion_tokens,
+        # total_tokens, reasoning_tokens.
+        try:
+            self._on_usage({
+                "input": int(getattr(usage, "input_text_tokens", 0) or 0),
+                "output": int(getattr(usage, "completion_tokens", 0) or 0),
+                "total": int(getattr(usage, "total_tokens", 0) or 0),
+            })
+        except Exception:
+            pass
 
 
 class _YandexAssistantToolCallMessage:
@@ -151,9 +171,9 @@ class YandexAgent:
         self,
         model: str = "yandexgpt",
         model_version: str = "latest",
-        max_tool_calls: int = 15,
+        max_tool_calls: int = 64,
         max_wallclock_sec: float = 900.0,
-        temperature: float = 0.2,
+        temperature: float = 0.6,
         folder_id: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> None:
@@ -186,6 +206,7 @@ class YandexAgent:
         completions = self._sdk.models.completions(model,
                                                     model_version=model_version)
         self._model = completions.configure(temperature=temperature)
+        self._model_name = model    # raw short name for pricing lookup
         self._max_tool_calls = max_tool_calls
         self._max_wallclock_sec = max_wallclock_sec
 
@@ -200,8 +221,18 @@ class YandexAgent:
         sdk_tools = [self._sdk.tools.function(
             parameters=t.json_schema, name=t.name, description=t.description)
             for t in tools]
+        from .pricing import cost_rub as _cost_rub
+        def on_usage(u):
+            ev = {"event": "TOKEN_USAGE", "iter": context.iteration,
+                  "model": self._model_name,
+                  "input": u["input"], "output": u["output"],
+                  "total": u["total"]}
+            c = _cost_rub(self._model_name, u["input"], u["output"])
+            if c is not None:
+                ev["cost_rub"] = round(c, 6)
+            context.on_event(ev)
         driver = ReActDriver(
-            backend=_YandexBackend(self._model, sdk_tools),
+            backend=_YandexBackend(self._model, sdk_tools, on_usage=on_usage),
             tools=tools, context=context,
             max_tool_calls=self._max_tool_calls,
             max_wallclock_sec=self._max_wallclock_sec,
